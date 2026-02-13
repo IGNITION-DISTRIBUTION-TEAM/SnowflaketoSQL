@@ -44,6 +44,11 @@ def insert_data():
             [1, "row2_col1", "row2_col2", ...]
         ]
     }
+    
+    URL Parameters:
+    - table: Target table name (required)
+    
+    Example: /insert-data?table=MyTable
     """
     # Verify authentication
     if not verify_token(request):
@@ -96,72 +101,13 @@ def insert_data():
         cursor.close()
         conn.close()
         
+        print(f"Insert complete: {success_count} success, {error_count} errors")
+        
         # Return results in Snowflake external function format
         response = {
             'data': results
         }
         
-        return jsonify(response), 200
-        
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Critical error: {error_msg}")
-        return jsonify({'statusCode': 500, 'body': f'Server error: {error_msg}'}), 500
-
-@app.route('/upsert-data', methods=['POST'])
-def upsert_data():
-    """
-    Endpoint to upsert data (insert or update) into SQL Server
-    Requires primary key column(s) to be specified
-    """
-    if not verify_token(request):
-        return jsonify({'statusCode': 401, 'body': 'Unauthorized'}), 401
-    
-    try:
-        payload = request.get_json()
-        
-        if not payload or 'data' not in payload:
-            return jsonify({'statusCode': 400, 'body': 'Invalid payload format'}), 400
-        
-        rows_data = payload['data']
-        target_table = request.args.get('table')
-        # Comma-separated list of key columns for MERGE
-        key_columns = request.args.get('keys', '').split(',')
-        
-        if not target_table or not key_columns[0]:
-            return jsonify({'statusCode': 400, 'body': 'Missing table or keys parameter'}), 400
-        
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-        
-        results = []
-        success_count = 0
-        
-        for row in rows_data:
-            try:
-                row_num = row[0]
-                data_values = row[1:]
-                
-                # This is a simplified upsert - you'll need to customize based on your schema
-                # Using MERGE statement for upsert
-                # You'll need to adjust this based on your actual table structure
-                
-                cursor.execute(f"SELECT COUNT(*) FROM {target_table}")
-                # Implement your MERGE or UPDATE/INSERT logic here
-                
-                success_count += 1
-                results.append([row_num, 'SUCCESS', None])
-                
-            except Exception as e:
-                error_msg = str(e)
-                results.append([row_num, 'ERROR', error_msg])
-                print(f"Error upserting row {row_num}: {error_msg}")
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
-        
-        response = {'data': results}
         return jsonify(response), 200
         
     except Exception as e:
