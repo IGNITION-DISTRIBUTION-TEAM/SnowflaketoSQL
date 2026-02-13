@@ -11,10 +11,11 @@ SQL_SERVER = os.environ.get('SQL_SERVER')
 SQL_DATABASE = os.environ.get('SQL_DATABASE')
 SQL_USERNAME = os.environ.get('SQL_USERNAME')
 SQL_PASSWORD = os.environ.get('SQL_PASSWORD')
+API_SECRET = os.environ.get('API_SECRET')
 SQL_DRIVER = '{ODBC Driver 17 for SQL Server}'
 
 # Authentication token for security
-API_TOKEN = os.environ.get('API_TOKEN', 'your-secret-token-here')
+API_TOKEN = os.environ.get('API_TOKEN', API_SECRET)
 
 def get_sql_connection():
     """Create and return SQL Server connection"""
