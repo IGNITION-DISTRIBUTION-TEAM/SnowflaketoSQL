@@ -13,7 +13,7 @@ SQL_USERNAME = os.environ.get('SQL_USERNAME')
 SQL_PASSWORD = os.environ.get('SQL_PASSWORD')
 
 # Authentication token for security
-API_TOKEN = os.environ.get('API_TOKEN', API_SECRET)
+API_TOKEN = os.environ.get('API_SECRET')
 
 def get_sql_connection():
     """Create and return SQL Server connection"""
