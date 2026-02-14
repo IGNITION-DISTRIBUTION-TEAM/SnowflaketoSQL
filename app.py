@@ -37,6 +37,89 @@ def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
 
+@app.route('/test-connection', methods=['GET'])
+def test_connection():
+    """Test SQL Server connection with detailed diagnostics"""
+    if not verify_token(request):
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    import socket
+    
+    result = {
+        'timestamp': datetime.utcnow().isoformat(),
+        'config': {
+            'sql_server': SQL_SERVER,
+            'sql_database': SQL_DATABASE,
+            'sql_username': SQL_USERNAME
+        }
+    }
+    
+    # Test 1: DNS Resolution
+    try:
+        server_host = SQL_SERVER.split(':')[0].split('\\')[0]
+        ip = socket.gethostbyname(server_host)
+        result['dns_resolution'] = f"✓ Resolved to {ip}"
+    except Exception as e:
+        result['dns_resolution'] = f"✗ DNS Error: {str(e)}"
+    
+    # Test 2: Port Connectivity
+    try:
+        server_parts = SQL_SERVER.split(':')
+        host = server_parts[0].split('\\')[0]
+        port = int(server_parts[1]) if len(server_parts) > 1 else 1433
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        conn_result = sock.connect_ex((host, port))
+        sock.close()
+        
+        if conn_result == 0:
+            result['port_check'] = f"✓ Port {port} is OPEN"
+        else:
+            result['port_check'] = f"✗ Port {port} is CLOSED (Error code: {conn_result})"
+    except Exception as e:
+        result['port_check'] = f"✗ Port test error: {str(e)}"
+    
+    # Test 3: SQL Server Connection
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT @@VERSION')
+        version = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        
+        result['sql_connection'] = "✓ Connected successfully"
+        result['sql_version'] = version[:100]  # First 100 chars
+        result['status'] = 'SUCCESS'
+    except Exception as e:
+        result['sql_connection'] = f"✗ Connection failed: {str(e)}"
+        result['status'] = 'FAILED'
+    
+    return jsonify(result), 200 if result['status'] == 'SUCCESS' else 500
+
+@app.route('/my-ip', methods=['GET'])
+def my_ip():
+    """Show Render's outbound IP address - use this IP in Azure firewall"""
+    import requests
+    try:
+        response = requests.get('https://api.ipify.org?format=json', timeout=10)
+        ip_data = response.json()
+        return jsonify({
+            'render_outbound_ip': ip_data['ip'],
+            'message': 'Add this IP to Azure SQL firewall rules',
+            'instructions': [
+                '1. Go to Azure Portal',
+                '2. Navigate to ig-sa-silversurfer-prd SQL Server',
+                '3. Click Networking',
+                '4. Add firewall rule with this IP',
+                '5. Wait 2 minutes',
+                '6. Try /test-connection again'
+            ]
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/insert-data', methods=['POST'])
 def insert_data():
     """
@@ -85,12 +168,15 @@ def insert_data():
                 row_num = row[0]
                 data_values = row[1:]
                 
+                # Convert to tuple for pymssql (it doesn't accept lists)
+                data_tuple = tuple(data_values)
+                
                 # Build dynamic INSERT statement
                 # Adjust the number of placeholders based on your columns
-                placeholders = ', '.join(['?' for _ in data_values])
+                placeholders = ', '.join(['%s' for _ in data_values])
                 insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
                 
-                cursor.execute(insert_sql, data_values)
+                cursor.execute(insert_sql, data_tuple)
                 success_count += 1
                 results.append([row_num, 'SUCCESS', None])
                 
@@ -127,3 +213,8 @@ def insert_data():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
+
+
+
