@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import pyodbc
+import pymssql
 import json
 import os
 from datetime import datetime
@@ -11,16 +11,19 @@ SQL_SERVER = os.environ.get('SQL_SERVER')
 SQL_DATABASE = os.environ.get('SQL_DATABASE')
 SQL_USERNAME = os.environ.get('SQL_USERNAME')
 SQL_PASSWORD = os.environ.get('SQL_PASSWORD')
-API_SECRET = os.environ.get('API_SECRET')
-SQL_DRIVER = '{ODBC Driver 17 for SQL Server}'
 
 # Authentication token for security
 API_TOKEN = os.environ.get('API_TOKEN', API_SECRET)
 
 def get_sql_connection():
     """Create and return SQL Server connection"""
-    conn_string = f'DRIVER={SQL_DRIVER};SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};UID={SQL_USERNAME};PWD={SQL_PASSWORD}'
-    return pyodbc.connect(conn_string)
+    conn = pymssql.connect(
+        server=SQL_SERVER,
+        user=SQL_USERNAME,
+        password=SQL_PASSWORD,
+        database=SQL_DATABASE
+    )
+    return conn
 
 def verify_token(request):
     """Verify the API token from request headers"""
@@ -115,6 +118,11 @@ def insert_data():
         error_msg = str(e)
         print(f"Critical error: {error_msg}")
         return jsonify({'statusCode': 500, 'body': f'Server error: {error_msg}'}), 500
+
+# =============================================================================
+# UPSERT/UPDATE/DELETE/TRUNCATE ENDPOINTS REMOVED
+# This application only supports INSERT operations for security
+# =============================================================================
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
