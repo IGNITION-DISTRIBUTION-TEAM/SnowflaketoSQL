@@ -1,22 +1,15 @@
-FROM python:3.11-slim
-
-# Install dependencies for ODBC driver
-RUN apt-get update && apt-get install -y \
-    curl gnupg2 unixodbc unixodbc-dev gcc g++ build-essential libssl1.1 libkrb5-3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Add Microsoft repository
-RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/microsoft.gpg \
-    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update \
-    && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \
-    && rm -rf /var/lib/apt/lists/*
+FROM mcr.microsoft.com/mssql-tools:17.10.2.1-ubuntu-22.04
 
 WORKDIR /app
 COPY . .
 
+# Install Python 3.11 and pip
+RUN apt-get update && \
+    apt-get install -y python3.11 python3.11-venv python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3.11 -m pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 10000
 
