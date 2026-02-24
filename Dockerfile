@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install dependencies and ODBC driver
+# Install system dependencies and ODBC driver
 RUN apt-get update && apt-get install -y \
     curl gnupg unixodbc unixodbc-dev gcc g++ build-essential \
     && rm -rf /var/lib/apt/lists/*
