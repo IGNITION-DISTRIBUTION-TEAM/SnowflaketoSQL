@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft repository for ODBC driver
+# Add Microsoft package repository
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list
 
@@ -24,7 +24,7 @@ RUN apt-get update \
 # Set working directory
 WORKDIR /app
 
-# Copy your code
+# Copy app code
 COPY . .
 
 # Install Python dependencies
@@ -33,5 +33,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Expose port
 EXPOSE 10000
 
-# Start app
+# Start Flask via Gunicorn
 CMD ["gunicorn", "app:app", "--workers", "2", "--timeout", "300", "--bind", "0.0.0.0:10000"]
