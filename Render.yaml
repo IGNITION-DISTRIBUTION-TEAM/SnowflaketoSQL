@@ -1,9 +1,8 @@
 services:
   - type: web
     name: snowflake-sql-bridge
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    env: docker
+    dockerfilePath: Dockerfile
     envVars:
       - key: SQL_SERVER
         sync: false
@@ -15,5 +14,3 @@ services:
         sync: false
       - key: API_TOKEN
         generateValue: true
-      - key: PYTHON_VERSION
-        value: 3.11.9
