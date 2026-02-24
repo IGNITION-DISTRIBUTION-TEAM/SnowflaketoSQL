@@ -1,6 +1,7 @@
+# Use Python slim image
 FROM python:3.11-slim
 
-# Install dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
@@ -11,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft package repo
+# Add Microsoft repository for ODBC driver
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list
 
@@ -23,10 +24,10 @@ RUN apt-get update \
 # Set working directory
 WORKDIR /app
 
-# Copy files
+# Copy your code
 COPY . .
 
-# Install Python deps
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Expose port
