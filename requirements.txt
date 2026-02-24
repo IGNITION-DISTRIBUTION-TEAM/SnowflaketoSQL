@@ -1,6 +1,4 @@
 Flask==3.0.0
-pymssql==2.2.8
+pyodbc
 gunicorn==21.2.0
 Werkzeug==3.0.1
-pyodbc
-flask
