@@ -1,11 +1,11 @@
 FROM python:3.11-slim
 
-# Install dependencies
+# Install dependencies for ODBC driver
 RUN apt-get update && apt-get install -y \
     curl gnupg2 unixodbc unixodbc-dev gcc g++ build-essential libssl1.1 libkrb5-3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Microsoft repo and install ODBC Driver 18
+# Add Microsoft repository
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/microsoft.gpg \
     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
@@ -15,7 +15,7 @@ RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /us
 WORKDIR /app
 COPY . .
 
-# Install Python dependencies
+# Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 10000
