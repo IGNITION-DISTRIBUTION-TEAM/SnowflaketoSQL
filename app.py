@@ -17,7 +17,7 @@ BATCH_SIZE = 5000  # Optimized for 300k+ rows
 # Database connection
 def get_sql_connection():
     connection_string = (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        "DRIVER={ODBC Driver 17 for SQL Server};"
         f"SERVER={SQL_SERVER};"
         f"DATABASE={SQL_DATABASE};"
         f"UID={SQL_USERNAME};"
