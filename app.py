@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 import pymssql
 import os
 import pandas as pd
-import numpy as np
 from datetime import datetime
 
 app = Flask(__name__)
@@ -16,7 +15,7 @@ SQL_USERNAME = os.environ.get("SQL_USERNAME")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
 API_TOKEN = os.environ.get("API_TOKEN")
 
-BATCH_SIZE = 5000  # Works safely with 300k+ rows
+BATCH_SIZE = 200  # safer starting batch size for 1000+ rows
 
 # ===============================
 # DATABASE CONNECTION
@@ -87,6 +86,7 @@ def insert_data():
         total_inserted = 0
         results = []
         batch_data = []
+        batch_row_nums = []
 
         for row in rows_data:
             row_num = row[0]
@@ -99,21 +99,39 @@ def insert_data():
             # Convert NaN / pd.NaT to None for SQL
             clean_values = [None if pd.isna(v) else v for v in data_values]
             batch_data.append(tuple(clean_values))
-            results.append([row_num, "SUCCESS", None])
+            batch_row_nums.append(row_num)
 
             # Insert in batches
             if len(batch_data) >= BATCH_SIZE:
-                cursor.executemany(insert_sql, batch_data)
-                conn.commit()
-                total_inserted += len(batch_data)
-                print(f"Inserted batch. Total so far: {total_inserted}")
+                try:
+                    cursor.executemany(insert_sql, batch_data)
+                    conn.commit()
+                    total_inserted += len(batch_data)
+                    print(f"Inserted batch. Total so far: {total_inserted}")
+                    # Mark success for this batch
+                    for rn in batch_row_nums:
+                        results.append([rn, "SUCCESS", None])
+                except Exception as e:
+                    conn.rollback()
+                    print(f"Batch failed: {e}")
+                    for rn in batch_row_nums:
+                        results.append([rn, "ERROR", str(e)])
                 batch_data = []
+                batch_row_nums = []
 
         # Insert remaining rows
         if batch_data:
-            cursor.executemany(insert_sql, batch_data)
-            conn.commit()
-            total_inserted += len(batch_data)
+            try:
+                cursor.executemany(insert_sql, batch_data)
+                conn.commit()
+                total_inserted += len(batch_data)
+                for rn in batch_row_nums:
+                    results.append([rn, "SUCCESS", None])
+            except Exception as e:
+                conn.rollback()
+                print(f"Final batch failed: {e}")
+                for rn in batch_row_nums:
+                    results.append([rn, "ERROR", str(e)])
 
         cursor.close()
         conn.close()
