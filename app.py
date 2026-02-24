@@ -37,89 +37,6 @@ def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
 
-@app.route('/test-connection', methods=['GET'])
-def test_connection():
-    """Test SQL Server connection with detailed diagnostics"""
-    if not verify_token(request):
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    import socket
-    
-    result = {
-        'timestamp': datetime.utcnow().isoformat(),
-        'config': {
-            'sql_server': SQL_SERVER,
-            'sql_database': SQL_DATABASE,
-            'sql_username': SQL_USERNAME
-        }
-    }
-    
-    # Test 1: DNS Resolution
-    try:
-        server_host = SQL_SERVER.split(':')[0].split('\\')[0]
-        ip = socket.gethostbyname(server_host)
-        result['dns_resolution'] = f"✓ Resolved to {ip}"
-    except Exception as e:
-        result['dns_resolution'] = f"✗ DNS Error: {str(e)}"
-    
-    # Test 2: Port Connectivity
-    try:
-        server_parts = SQL_SERVER.split(':')
-        host = server_parts[0].split('\\')[0]
-        port = int(server_parts[1]) if len(server_parts) > 1 else 1433
-        
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        conn_result = sock.connect_ex((host, port))
-        sock.close()
-        
-        if conn_result == 0:
-            result['port_check'] = f"✓ Port {port} is OPEN"
-        else:
-            result['port_check'] = f"✗ Port {port} is CLOSED (Error code: {conn_result})"
-    except Exception as e:
-        result['port_check'] = f"✗ Port test error: {str(e)}"
-    
-    # Test 3: SQL Server Connection
-    try:
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT @@VERSION')
-        version = cursor.fetchone()[0]
-        cursor.close()
-        conn.close()
-        
-        result['sql_connection'] = "✓ Connected successfully"
-        result['sql_version'] = version[:100]  # First 100 chars
-        result['status'] = 'SUCCESS'
-    except Exception as e:
-        result['sql_connection'] = f"✗ Connection failed: {str(e)}"
-        result['status'] = 'FAILED'
-    
-    return jsonify(result), 200 if result['status'] == 'SUCCESS' else 500
-
-@app.route('/my-ip', methods=['GET'])
-def my_ip():
-    """Show Render's outbound IP address - use this IP in Azure firewall"""
-    import requests
-    try:
-        response = requests.get('https://api.ipify.org?format=json', timeout=10)
-        ip_data = response.json()
-        return jsonify({
-            'render_outbound_ip': ip_data['ip'],
-            'message': 'Add this IP to Azure SQL firewall rules',
-            'instructions': [
-                '1. Go to Azure Portal',
-                '2. Navigate to ig-sa-silversurfer-prd SQL Server',
-                '3. Click Networking',
-                '4. Add firewall rule with this IP',
-                '5. Wait 2 minutes',
-                '6. Try /test-connection again'
-            ]
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/insert-data', methods=['POST'])
 def insert_data():
     """
@@ -134,8 +51,9 @@ def insert_data():
     
     URL Parameters:
     - table: Target table name (required)
+    - columns: Comma-separated column names (optional)
     
-    Example: /insert-data?table=MyTable
+    Example: /insert-data?table=MyTable&columns=col1,col2,col3
     """
     # Verify authentication
     if not verify_token(request):
@@ -149,9 +67,17 @@ def insert_data():
         
         rows_data = payload['data']
         target_table = request.args.get('table')
+        columns_param = request.args.get('columns')  # Get columns parameter
         
         if not target_table:
             return jsonify({'statusCode': 400, 'body': 'Missing table parameter'}), 400
+        
+        # Log what we received
+        sample_row = rows_data[0] if rows_data else []
+        data_column_count = len(sample_row) - 1  # Subtract row number
+        print(f"Table: {target_table}")
+        print(f"Columns param: {columns_param}")
+        print(f"Data column count: {data_column_count}")
         
         # Connect to SQL Server
         conn = get_sql_connection()
@@ -172,9 +98,23 @@ def insert_data():
                 data_tuple = tuple(data_values)
                 
                 # Build dynamic INSERT statement
-                # Adjust the number of placeholders based on your columns
-                placeholders = ', '.join(['%s' for _ in data_values])
-                insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
+                if columns_param:
+                    # If columns are specified, use them
+                    columns = [col.strip() for col in columns_param.split(',')]
+                    
+                    # Validate column count
+                    if len(data_values) != len(columns):
+                        raise ValueError(
+                            f"Column mismatch: {len(data_values)} values but {len(columns)} columns specified"
+                        )
+                    
+                    columns_str = ', '.join([f'[{col}]' for col in columns])
+                    placeholders = ', '.join(['%s' for _ in data_values])
+                    insert_sql = f"INSERT INTO {target_table} ({columns_str}) VALUES ({placeholders})"
+                else:
+                    # If no columns specified, insert into all columns
+                    placeholders = ', '.join(['%s' for _ in data_values])
+                    insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
                 
                 cursor.execute(insert_sql, data_tuple)
                 success_count += 1
@@ -184,7 +124,8 @@ def insert_data():
                 error_count += 1
                 error_msg = str(e)
                 results.append([row_num, 'ERROR', error_msg])
-                print(f"Error inserting row {row_num}: {error_msg}")
+                if error_count <= 3:  # Only log first 3 errors
+                    print(f"Error inserting row {row_num}: {error_msg}")
         
         # Commit all successful inserts
         conn.commit()
@@ -213,8 +154,3 @@ def insert_data():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
-
-
-
