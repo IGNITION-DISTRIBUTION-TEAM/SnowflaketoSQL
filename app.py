@@ -143,10 +143,15 @@ def insert_data():
                         for _ in batch_data
                     )
                     sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {row_placeholders}"
-                    flat_values = [v for row in batch_data for v in row]
+                    flat_values = tuple(v for row in batch_data for v in row)  # pymssql requires tuple not list
 
+                    t0 = datetime.now()
                     cursor.execute(sql, flat_values)
+                    exec_ms = (datetime.now() - t0).total_seconds() * 1000
+
+                    t1 = datetime.now()
                     conn.commit()
+                    commit_ms = (datetime.now() - t1).total_seconds() * 1000
 
                     batch_count = len(batch_data)
                     total_inserted += batch_count
@@ -154,7 +159,7 @@ def insert_data():
                     for rn in batch_row_nums:
                         results.append([rn, "SUCCESS", None])
 
-                    print(f"Batch {batch_start}-{batch_end}: Inserted {batch_count} rows. Total: {total_inserted}/{total_rows}")
+                    print(f"Batch {batch_start}-{batch_end}: {batch_count} rows | execute={exec_ms:.0f}ms commit={commit_ms:.0f}ms | Total: {total_inserted}/{total_rows}")
 
                 except Exception as e:
                     conn.rollback()
