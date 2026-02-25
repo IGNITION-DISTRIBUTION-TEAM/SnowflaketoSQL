@@ -15,8 +15,7 @@ SQL_USERNAME = os.environ.get("SQL_USERNAME")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
 API_TOKEN = os.environ.get("API_TOKEN")
 
-BATCH_SIZE = 1000  # Larger batches for better performance
-CONNECTION_TIMEOUT = 60  # Increase connection timeout
+CONNECTION_TIMEOUT = 60
 
 # ===============================
 # DATABASE CONNECTION
@@ -41,6 +40,14 @@ def verify_token(req):
     return token == f"Bearer {API_TOKEN}"
 
 # ===============================
+# SAFE BATCH SIZE CALCULATOR
+# SQL Server 2012 has a 2100 parameter limit per query
+# ===============================
+def get_batch_size(num_columns):
+    max_params = 2000  # stay under 2100 limit with some buffer
+    return max(1, max_params // num_columns)
+
+# ===============================
 # HEALTH CHECK
 # ===============================
 @app.route("/health", methods=["GET"])
@@ -51,7 +58,7 @@ def health():
     }), 200
 
 # ===============================
-# INSERT ENDPOINT - OPTIMIZED
+# INSERT ENDPOINT - OPTIMIZED FOR SQL SERVER 2012
 # ===============================
 @app.route("/insert-data", methods=["POST"])
 def insert_data():
@@ -59,7 +66,7 @@ def insert_data():
         return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
 
     start_time = datetime.now()
-    
+
     try:
         payload = request.get_json()
         if not payload or "data" not in payload:
@@ -75,18 +82,18 @@ def insert_data():
         if not rows_data:
             return jsonify({"data": []}), 200
 
+        columns = [col.strip() for col in columns_param.split(",")]
+        num_columns = len(columns)
+        BATCH_SIZE = get_batch_size(num_columns)
+
         total_rows = len(rows_data)
         print(f"=== BATCH INSERT START ===")
         print(f"Table: {target_table}")
         print(f"Total rows: {total_rows}")
-        print(f"Batch size: {BATCH_SIZE}")
+        print(f"Columns: {num_columns}")
+        print(f"Batch size (auto-calculated): {BATCH_SIZE}")
 
-        # Prepare SQL insert
-        columns = [col.strip() for col in columns_param.split(",")]
         columns_str = ", ".join(f"[{col}]" for col in columns)
-        placeholders = ", ".join("%s" for _ in columns)
-
-        insert_sql = f"INSERT INTO {target_table} ({columns_str}) VALUES ({placeholders})"
 
         conn = get_sql_connection()
         cursor = conn.cursor()
@@ -94,58 +101,66 @@ def insert_data():
         total_inserted = 0
         total_errors = 0
         results = []
-        
-        # Process all rows in batches
+
         for batch_start in range(0, total_rows, BATCH_SIZE):
             batch_end = min(batch_start + BATCH_SIZE, total_rows)
             batch_rows = rows_data[batch_start:batch_end]
-            
+
             batch_data = []
             batch_row_nums = []
-            
-            # Prepare batch
+
             for row in batch_rows:
                 row_num = row[0]
                 data_values = row[1:]
-                
-                if len(data_values) != len(columns):
-                    results.append([row_num, "ERROR", f"Column mismatch: expected {len(columns)}, got {len(data_values)}"])
+
+                if len(data_values) != num_columns:
+                    results.append([row_num, "ERROR", f"Column mismatch: expected {num_columns}, got {len(data_values)}"])
                     total_errors += 1
                     continue
-                
-                # Clean data: convert NaN/NaT to None
+
                 clean_values = []
                 for v in data_values:
-                    if pd.isna(v):
+                    try:
+                        if v is None:
+                            clean_values.append(None)
+                        elif isinstance(v, float) and pd.isna(v):
+                            clean_values.append(None)
+                        elif isinstance(v, pd.Timestamp):
+                            clean_values.append(v.strftime('%Y-%m-%d %H:%M:%S'))
+                        else:
+                            clean_values.append(v)
+                    except (TypeError, ValueError):
                         clean_values.append(None)
-                    elif isinstance(v, pd.Timestamp):
-                        clean_values.append(v.strftime('%Y-%m-%d %H:%M:%S'))
-                    else:
-                        clean_values.append(v)
-                
+
                 batch_data.append(tuple(clean_values))
                 batch_row_nums.append(row_num)
-            
-            # Insert batch
+
             if batch_data:
                 try:
-                    cursor.executemany(insert_sql, batch_data)
+                    # Build one multi-row INSERT per batch — much faster than executemany with pymssql
+                    row_placeholders = ", ".join(
+                        "(" + ", ".join("%s" for _ in columns) + ")"
+                        for _ in batch_data
+                    )
+                    sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {row_placeholders}"
+                    flat_values = [v for row in batch_data for v in row]
+
+                    cursor.execute(sql, flat_values)
                     conn.commit()
+
                     batch_count = len(batch_data)
                     total_inserted += batch_count
-                    
-                    # Mark all rows in batch as success
+
                     for rn in batch_row_nums:
                         results.append([rn, "SUCCESS", None])
-                    
+
                     print(f"Batch {batch_start}-{batch_end}: Inserted {batch_count} rows. Total: {total_inserted}/{total_rows}")
-                    
+
                 except Exception as e:
                     conn.rollback()
-                    error_msg = str(e)[:200]  # Truncate long errors
+                    error_msg = str(e)[:200]
                     print(f"Batch {batch_start}-{batch_end} FAILED: {error_msg}")
-                    
-                    # Mark all rows in batch as error
+
                     for rn in batch_row_nums:
                         results.append([rn, "ERROR", error_msg])
                     total_errors += len(batch_data)
@@ -154,14 +169,14 @@ def insert_data():
         conn.close()
 
         duration = (datetime.now() - start_time).total_seconds()
-        
+
         print(f"=== BATCH INSERT COMPLETE ===")
         print(f"Total rows: {total_rows}")
         print(f"Inserted: {total_inserted}")
         print(f"Errors: {total_errors}")
         print(f"Duration: {duration:.2f}s")
         print(f"Rate: {total_rows/duration:.0f} rows/sec")
-        
+
         return jsonify({"data": results}), 200
 
     except Exception as e:
@@ -179,5 +194,4 @@ def insert_data():
 # ===============================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    # Disable debug mode for production performance
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
