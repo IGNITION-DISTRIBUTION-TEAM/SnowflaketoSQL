@@ -3,25 +3,32 @@ import pymssql
 import os
 import pandas as pd
 from datetime import datetime
+import threading
 
 app = Flask(__name__)
 
 # ===============================
 # ENVIRONMENT VARIABLES
 # ===============================
-SQL_SERVER = os.environ.get("SQL_SERVER")
+SQL_SERVER   = os.environ.get("SQL_SERVER")
 SQL_DATABASE = os.environ.get("SQL_DATABASE")
 SQL_USERNAME = os.environ.get("SQL_USERNAME")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
-API_TOKEN = os.environ.get("API_TOKEN")
+API_TOKEN    = os.environ.get("API_TOKEN")
 
 CONNECTION_TIMEOUT = 60
 
 # ===============================
-# DATABASE CONNECTION
+# CONNECTION POOL
+# Keeps a small pool of persistent connections so we don't pay the
+# TCP + auth handshake cost on every /insert-data request.
 # ===============================
-def get_sql_connection():
-    conn = pymssql.connect(
+_pool      = []
+_pool_lock = threading.Lock()
+POOL_SIZE  = 3
+
+def _new_conn():
+    return pymssql.connect(
         server=SQL_SERVER,
         user=SQL_USERNAME,
         password=SQL_PASSWORD,
@@ -30,22 +37,66 @@ def get_sql_connection():
         timeout=CONNECTION_TIMEOUT,
         login_timeout=30
     )
-    return conn
+
+def get_connection():
+    """Return a pooled connection, creating one if the pool is empty."""
+    with _pool_lock:
+        if _pool:
+            return _pool.pop()
+    return _new_conn()
+
+def return_connection(conn):
+    """Return a healthy connection back to the pool."""
+    with _pool_lock:
+        if len(_pool) < POOL_SIZE:
+            _pool.append(conn)
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def invalidate_connection(conn):
+    """Discard a broken connection — do not return it to the pool."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+# Pre-warm the pool on startup
+def _prewarm_pool():
+    for _ in range(POOL_SIZE):
+        try:
+            with _pool_lock:
+                _pool.append(_new_conn())
+        except Exception as e:
+            print(f"Pool prewarm failed: {e}")
+
+_prewarm_pool()
+
 
 # ===============================
-# AUTH
+# HELPERS
 # ===============================
 def verify_token(req):
-    token = req.headers.get("Authorization")
-    return token == f"Bearer {API_TOKEN}"
+    return req.headers.get("Authorization") == f"Bearer {API_TOKEN}"
 
-# ===============================
-# SAFE BATCH SIZE CALCULATOR
-# SQL Server 2012 has a 2100 parameter limit per query
-# ===============================
 def get_batch_size(num_columns):
-    max_params = 2000  # stay under 2100 limit with some buffer
-    return max(1, max_params // num_columns)
+    """Stay under SQL Server 2012's 2100 parameter limit."""
+    return max(1, 2000 // num_columns)
+
+def clean_value(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        if isinstance(v, pd.Timestamp):
+            return v.strftime('%Y-%m-%d %H:%M:%S')
+        return v
+    except (TypeError, ValueError):
+        return None
+
 
 # ===============================
 # HEALTH CHECK
@@ -54,11 +105,13 @@ def get_batch_size(num_columns):
 def health():
     return jsonify({
         "status": "healthy",
+        "pool_size": len(_pool),
         "timestamp": datetime.utcnow().isoformat()
     }), 200
 
+
 # ===============================
-# INSERT ENDPOINT - OPTIMIZED FOR SQL SERVER 2012
+# INSERT ENDPOINT
 # ===============================
 @app.route("/insert-data", methods=["POST"])
 def insert_data():
@@ -70,129 +123,112 @@ def insert_data():
     try:
         payload = request.get_json()
         if not payload or "data" not in payload:
-            return jsonify({"statusCode": 400, "body": "Invalid payload format"}), 400
+            return jsonify({"statusCode": 400, "body": "Invalid payload"}), 400
 
-        rows_data = payload["data"]
-        target_table = request.args.get("table")
-        columns_param = request.args.get("columns")
+        rows_data      = payload["data"]
+        target_table   = request.args.get("table")
+        columns_param  = request.args.get("columns")
 
         if not target_table or not columns_param:
-            return jsonify({"statusCode": 400, "body": "Missing table or columns parameter"}), 400
+            return jsonify({"statusCode": 400, "body": "Missing table or columns"}), 400
 
         if not rows_data:
             return jsonify({"data": []}), 200
 
-        columns = [col.strip() for col in columns_param.split(",")]
-        num_columns = len(columns)
-        BATCH_SIZE = get_batch_size(num_columns)
+        columns      = [c.strip() for c in columns_param.split(",")]
+        num_columns  = len(columns)
+        BATCH_SIZE   = get_batch_size(num_columns)
+        columns_str  = ", ".join(f"[{c}]" for c in columns)
+        total_rows   = len(rows_data)
 
-        total_rows = len(rows_data)
-        print(f"=== BATCH INSERT START ===")
-        print(f"Table: {target_table}")
-        print(f"Total rows: {total_rows}")
-        print(f"Columns: {num_columns}")
-        print(f"Batch size (auto-calculated): {BATCH_SIZE}")
+        print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | batch={BATCH_SIZE}")
 
-        columns_str = ", ".join(f"[{col}]" for col in columns)
+        # ── BUILD ALL BATCHES UPFRONT ────────────────────────────────────────
+        # Validate and clean every row before touching the DB connection.
+        # This way we hold the connection for the shortest possible time.
+        batches  = []  # list of (row_nums, values_tuple)
+        bad_rows = []  # (row_num, error_msg) for column-mismatch rows
 
-        conn = get_sql_connection()
-        cursor = conn.cursor()
+        current_nums = []
+        current_vals = []
 
-        total_inserted = 0
-        total_errors = 0
+        for row in rows_data:
+            row_num     = row[0]
+            data_values = row[1:]
+
+            if len(data_values) != num_columns:
+                bad_rows.append((row_num, f"Column mismatch: expected {num_columns}, got {len(data_values)}"))
+                continue
+
+            current_nums.append(row_num)
+            current_vals.extend(clean_value(v) for v in data_values)
+
+            if len(current_nums) == BATCH_SIZE:
+                batches.append((list(current_nums), tuple(current_vals)))
+                current_nums = []
+                current_vals = []
+
+        if current_nums:
+            batches.append((current_nums, tuple(current_vals)))
+
+        # ── SINGLE CONNECTION FOR ALL BATCHES ────────────────────────────────
+        # One connection, one transaction per batch, connection returned to pool.
+        conn    = get_connection()
+        cursor  = conn.cursor()
         results = []
 
-        for batch_start in range(0, total_rows, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_rows)
-            batch_rows = rows_data[batch_start:batch_end]
+        total_inserted = 0
+        total_errors   = 0
 
-            batch_data = []
-            batch_row_nums = []
+        try:
+            for batch_nums, flat_vals in batches:
+                n = len(batch_nums)
+                row_placeholders = ", ".join(
+                    "(" + ", ".join(["%s"] * num_columns) + ")"
+                    for _ in range(n)
+                )
+                sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {row_placeholders}"
 
-            for row in batch_rows:
-                row_num = row[0]
-                data_values = row[1:]
-
-                if len(data_values) != num_columns:
-                    results.append([row_num, "ERROR", f"Column mismatch: expected {num_columns}, got {len(data_values)}"])
-                    total_errors += 1
-                    continue
-
-                clean_values = []
-                for v in data_values:
-                    try:
-                        if v is None:
-                            clean_values.append(None)
-                        elif isinstance(v, float) and pd.isna(v):
-                            clean_values.append(None)
-                        elif isinstance(v, pd.Timestamp):
-                            clean_values.append(v.strftime('%Y-%m-%d %H:%M:%S'))
-                        else:
-                            clean_values.append(v)
-                    except (TypeError, ValueError):
-                        clean_values.append(None)
-
-                batch_data.append(tuple(clean_values))
-                batch_row_nums.append(row_num)
-
-            if batch_data:
+                t0 = datetime.now()
                 try:
-                    # Build one multi-row INSERT per batch — much faster than executemany with pymssql
-                    row_placeholders = ", ".join(
-                        "(" + ", ".join("%s" for _ in columns) + ")"
-                        for _ in batch_data
-                    )
-                    sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {row_placeholders}"
-                    flat_values = tuple(v for row in batch_data for v in row)  # pymssql requires tuple not list
-
-                    t0 = datetime.now()
-                    cursor.execute(sql, flat_values)
+                    cursor.execute(sql, flat_vals)
+                    conn.commit()
                     exec_ms = (datetime.now() - t0).total_seconds() * 1000
 
-                    t1 = datetime.now()
-                    conn.commit()
-                    commit_ms = (datetime.now() - t1).total_seconds() * 1000
-
-                    batch_count = len(batch_data)
-                    total_inserted += batch_count
-
-                    for rn in batch_row_nums:
-                        results.append([rn, "SUCCESS", None])
-
-                    print(f"Batch {batch_start}-{batch_end}: {batch_count} rows | execute={exec_ms:.0f}ms commit={commit_ms:.0f}ms | Total: {total_inserted}/{total_rows}")
+                    total_inserted += n
+                    results.extend([rn, "SUCCESS", None] for rn in batch_nums)
+                    print(f"  Batch {n} rows | {exec_ms:.0f}ms | total {total_inserted}/{total_rows}")
 
                 except Exception as e:
                     conn.rollback()
-                    error_msg = str(e)[:200]
-                    print(f"Batch {batch_start}-{batch_end} FAILED: {error_msg}")
+                    err = str(e)[:200]
+                    print(f"  Batch FAILED: {err}")
+                    total_errors += n
+                    results.extend([rn, "ERROR", err] for rn in batch_nums)
 
-                    for rn in batch_row_nums:
-                        results.append([rn, "ERROR", error_msg])
-                    total_errors += len(batch_data)
+            cursor.close()
+            return_connection(conn)   # ← return healthy connection to pool
 
-        cursor.close()
-        conn.close()
+        except Exception:
+            invalidate_connection(conn)   # ← discard broken connection
+            raise
+
+        # Add any pre-validation errors
+        for rn, err in bad_rows:
+            results.append([rn, "ERROR", err])
+            total_errors += 1
 
         duration = (datetime.now() - start_time).total_seconds()
-
-        print(f"=== BATCH INSERT COMPLETE ===")
-        print(f"Total rows: {total_rows}")
-        print(f"Inserted: {total_inserted}")
-        print(f"Errors: {total_errors}")
-        print(f"Duration: {duration:.2f}s")
-        print(f"Rate: {total_rows/duration:.0f} rows/sec")
+        print(f"DONE | {total_inserted} inserted | {total_errors} errors | "
+              f"{duration:.2f}s | {total_rows/max(duration,0.01):.0f} rows/s")
 
         return jsonify({"data": results}), 200
 
     except Exception as e:
         duration = (datetime.now() - start_time).total_seconds()
-        error_msg = str(e)
-        print(f"=== CRITICAL ERROR after {duration:.2f}s ===")
-        print(f"Error: {error_msg}")
-        return jsonify({
-            "statusCode": 500,
-            "body": f"Server error: {error_msg}"
-        }), 500
+        print(f"CRITICAL ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
 
 # ===============================
 # APP START
