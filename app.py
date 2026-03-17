@@ -20,8 +20,6 @@ CONNECTION_TIMEOUT = 60
 
 # ===============================
 # CONNECTION POOL
-# Keeps a small pool of persistent connections so we don't pay the
-# TCP + auth handshake cost on every /insert-data request.
 # ===============================
 _pool      = []
 _pool_lock = threading.Lock()
@@ -39,14 +37,22 @@ def _new_conn():
     )
 
 def get_connection():
-    """Return a pooled connection, creating one if the pool is empty."""
+    """Return a pooled connection, validating it before use."""
     with _pool_lock:
-        if _pool:
-            return _pool.pop()
+        while _pool:
+            conn = _pool.pop()
+            try:
+                # Ping to confirm connection is still alive
+                conn.cursor().execute("SELECT 1")
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     return _new_conn()
 
 def return_connection(conn):
-    """Return a healthy connection back to the pool."""
     with _pool_lock:
         if len(_pool) < POOL_SIZE:
             _pool.append(conn)
@@ -57,22 +63,23 @@ def return_connection(conn):
         pass
 
 def invalidate_connection(conn):
-    """Discard a broken connection — do not return it to the pool."""
     try:
         conn.close()
     except Exception:
         pass
 
-# Pre-warm the pool on startup
-def _prewarm_pool():
+def prewarm_pool():
+    """Called on first request once env vars are guaranteed to be loaded."""
+    if _pool:
+        return
+    print("Pre-warming connection pool...")
     for _ in range(POOL_SIZE):
         try:
             with _pool_lock:
                 _pool.append(_new_conn())
         except Exception as e:
-            print(f"Pool prewarm failed: {e}")
-
-_prewarm_pool()
+            print(f"Pool prewarm failed (will connect on demand): {e}")
+    print(f"Pool ready with {len(_pool)} connection(s).")
 
 
 # ===============================
@@ -98,6 +105,12 @@ def clean_value(v):
         return None
 
 
+@app.before_request
+def initialize():
+    """Lazy pool init — runs once after Render has loaded all env vars."""
+    prewarm_pool()
+
+
 # ===============================
 # HEALTH CHECK
 # ===============================
@@ -112,6 +125,9 @@ def health():
 
 # ===============================
 # INSERT ENDPOINT
+# Optional query params:
+#   truncate=true   → TRUNCATE TABLE before inserting (full reload)
+#   nocheck=true    → Disable constraints during load (default: true)
 # ===============================
 @app.route("/insert-data", methods=["POST"])
 def insert_data():
@@ -125,9 +141,11 @@ def insert_data():
         if not payload or "data" not in payload:
             return jsonify({"statusCode": 400, "body": "Invalid payload"}), 400
 
-        rows_data      = payload["data"]
-        target_table   = request.args.get("table")
-        columns_param  = request.args.get("columns")
+        rows_data     = payload["data"]
+        target_table  = request.args.get("table")
+        columns_param = request.args.get("columns")
+        do_truncate   = request.args.get("truncate", "false").lower() == "true"
+        do_nocheck    = request.args.get("nocheck",  "true" ).lower() == "true"
 
         if not target_table or not columns_param:
             return jsonify({"statusCode": 400, "body": "Missing table or columns"}), 400
@@ -135,19 +153,18 @@ def insert_data():
         if not rows_data:
             return jsonify({"data": []}), 200
 
-        columns      = [c.strip() for c in columns_param.split(",")]
-        num_columns  = len(columns)
-        BATCH_SIZE   = get_batch_size(num_columns)
-        columns_str  = ", ".join(f"[{c}]" for c in columns)
-        total_rows   = len(rows_data)
+        columns     = [c.strip() for c in columns_param.split(",")]
+        num_columns = len(columns)
+        BATCH_SIZE  = get_batch_size(num_columns)
+        columns_str = ", ".join(f"[{c}]" for c in columns)
+        total_rows  = len(rows_data)
 
-        print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | batch={BATCH_SIZE}")
+        print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | "
+              f"batch={BATCH_SIZE} | truncate={do_truncate} | nocheck={do_nocheck}")
 
-        # ── BUILD ALL BATCHES UPFRONT ────────────────────────────────────────
-        # Validate and clean every row before touching the DB connection.
-        # This way we hold the connection for the shortest possible time.
-        batches  = []  # list of (row_nums, values_tuple)
-        bad_rows = []  # (row_num, error_msg) for column-mismatch rows
+        # ── VALIDATE + CLEAN ALL ROWS BEFORE TOUCHING THE DB ────────────────
+        batches  = []
+        bad_rows = []
 
         current_nums = []
         current_vals = []
@@ -171,8 +188,7 @@ def insert_data():
         if current_nums:
             batches.append((current_nums, tuple(current_vals)))
 
-        # ── SINGLE CONNECTION FOR ALL BATCHES ────────────────────────────────
-        # One connection, one transaction per batch, connection returned to pool.
+        # ── SINGLE CONNECTION FOR ENTIRE REQUEST ─────────────────────────────
         conn    = get_connection()
         cursor  = conn.cursor()
         results = []
@@ -181,13 +197,49 @@ def insert_data():
         total_errors   = 0
 
         try:
+            # ── OPTIONAL: TRUNCATE FIRST (full reload mode) ──────────────────
+            if do_truncate:
+                print(f"  Truncating {target_table}...")
+                cursor.execute(f"TRUNCATE TABLE {target_table}")
+                conn.commit()
+                print(f"  Truncated.")
+
+            # ── DISABLE CONSTRAINTS + INDEXES FOR BULK LOAD ──────────────────
+            # ALTER TABLE NOCHECK disables FK and CHECK constraints.
+            # DISABLE on indexes stops index maintenance during insert —
+            # they are rebuilt in one pass at the end via ALTER INDEX REBUILD,
+            # which is far faster than updating the index on every row.
+            if do_nocheck:
+                print(f"  Disabling constraints and indexes...")
+                cursor.execute(f"ALTER TABLE {target_table} NOCHECK CONSTRAINT ALL")
+                conn.commit()
+
+                # Disable all non-clustered indexes
+                cursor.execute(f"""
+                    DECLARE @sql NVARCHAR(MAX) = '';
+                    SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} DISABLE;'
+                    FROM sys.indexes i
+                    WHERE i.object_id = OBJECT_ID('{target_table}')
+                      AND i.type_desc = 'NONCLUSTERED'
+                      AND i.is_disabled = 0;
+                    EXEC sp_executesql @sql;
+                """)
+                conn.commit()
+                print(f"  Constraints and indexes disabled.")
+
+            # ── BULK INSERT ALL BATCHES ───────────────────────────────────────
             for batch_nums, flat_vals in batches:
                 n = len(batch_nums)
                 row_placeholders = ", ".join(
                     "(" + ", ".join(["%s"] * num_columns) + ")"
                     for _ in range(n)
                 )
-                sql = f"INSERT INTO {target_table} ({columns_str}) VALUES {row_placeholders}"
+                # TABLOCK: acquires a table-level lock for the duration of the
+                # insert — avoids row-level lock escalation overhead.
+                sql = (
+                    f"INSERT INTO {target_table} WITH (TABLOCK) "
+                    f"({columns_str}) VALUES {row_placeholders}"
+                )
 
                 t0 = datetime.now()
                 try:
@@ -206,21 +258,48 @@ def insert_data():
                     total_errors += n
                     results.extend([rn, "ERROR", err] for rn in batch_nums)
 
+            # ── RE-ENABLE CONSTRAINTS + REBUILD INDEXES ───────────────────────
+            # Rebuilding indexes in one pass after load is 5-10x faster than
+            # maintaining them incrementally during insert.
+            if do_nocheck:
+                print(f"  Re-enabling constraints and rebuilding indexes...")
+
+                cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
+                conn.commit()
+
+                cursor.execute(f"""
+                    DECLARE @sql NVARCHAR(MAX) = '';
+                    SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} REBUILD;'
+                    FROM sys.indexes i
+                    WHERE i.object_id = OBJECT_ID('{target_table}')
+                      AND i.type_desc = 'NONCLUSTERED'
+                      AND i.is_disabled = 1;
+                    EXEC sp_executesql @sql;
+                """)
+                conn.commit()
+                print(f"  Constraints re-enabled and indexes rebuilt.")
+
             cursor.close()
-            return_connection(conn)   # ← return healthy connection to pool
+            return_connection(conn)
 
         except Exception:
-            invalidate_connection(conn)   # ← discard broken connection
+            # Make sure we always re-enable constraints even on crash
+            try:
+                cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
+                conn.commit()
+            except Exception:
+                pass
+            invalidate_connection(conn)
             raise
 
-        # Add any pre-validation errors
+        # Add pre-validation errors
         for rn, err in bad_rows:
             results.append([rn, "ERROR", err])
             total_errors += 1
 
         duration = (datetime.now() - start_time).total_seconds()
         print(f"DONE | {total_inserted} inserted | {total_errors} errors | "
-              f"{duration:.2f}s | {total_rows/max(duration,0.01):.0f} rows/s")
+              f"{duration:.2f}s | {total_rows / max(duration, 0.01):.0f} rows/s")
 
         return jsonify({"data": results}), 200
 
