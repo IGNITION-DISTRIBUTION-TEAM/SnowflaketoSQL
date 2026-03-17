@@ -72,6 +72,19 @@ def prewarm_pool():
     """Called on first request once env vars are guaranteed to be loaded."""
     if _pool:
         return
+    # ── Diagnose env vars before attempting connection ────────────────────
+    print("=== ENV VAR CHECK ===")
+    print(f"  SQL_SERVER:   {'SET' if SQL_SERVER   else 'MISSING'} ({SQL_SERVER})")
+    print(f"  SQL_DATABASE: {'SET' if SQL_DATABASE else 'MISSING'} ({SQL_DATABASE})")
+    print(f"  SQL_USERNAME: {'SET' if SQL_USERNAME else 'MISSING'} ({SQL_USERNAME})")
+    print(f"  SQL_PASSWORD: {'SET' if SQL_PASSWORD else 'MISSING'} ({'***' if SQL_PASSWORD else 'MISSING'})")
+    print(f"  API_TOKEN:    {'SET' if API_TOKEN    else 'MISSING'}")
+    print("=====================")
+
+    if not all([SQL_SERVER, SQL_DATABASE, SQL_USERNAME, SQL_PASSWORD]):
+        print("ERROR: One or more required env vars are missing — skipping pool init")
+        return
+
     print("Pre-warming connection pool...")
     for _ in range(POOL_SIZE):
         try:
