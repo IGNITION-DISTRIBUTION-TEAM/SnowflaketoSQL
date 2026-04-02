@@ -111,11 +111,7 @@ def clean_value(v):
         if isinstance(v, str):
             stripped = v.strip()
             if stripped == '':
-                return None
-            # Skip numeric coercion for values starting with 0
-            # (phone numbers, ID numbers, account numbers, codes)
-            if stripped.startswith('0'):
-                return stripped
+                return None          # empty string → NULL
             try:
                 return int(stripped)
             except ValueError:
@@ -124,7 +120,7 @@ def clean_value(v):
                 return float(stripped)
             except ValueError:
                 pass
-            return stripped
+            return stripped          # leave as string if not numeric
         return v
     except (TypeError, ValueError):
         return None
