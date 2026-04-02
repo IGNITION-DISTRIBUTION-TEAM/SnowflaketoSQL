@@ -129,24 +129,6 @@ def clean_value(v):
 ALLOWED_OPERATORS = {"=", "!=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
 
 def build_where_clause(filters):
-    """
-    Build a parameterised WHERE clause from a list of filter dicts.
-
-    Each filter dict must have:
-        column   (str)  – column name
-        operator (str)  – one of ALLOWED_OPERATORS
-        value    (any)  – the value to compare against
-                          (ignored for IS NULL / IS NOT NULL)
-
-    Returns (where_str, params_tuple) or raises ValueError on bad input.
-
-    Example input:
-        [
-            {"column": "status",     "operator": "=",    "value": "active"},
-            {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
-            {"column": "deleted_at", "operator": "IS NULL"}
-        ]
-    """
     if not filters:
         return "", ()
 
@@ -162,7 +144,6 @@ def build_where_clause(filters):
         if op not in ALLOWED_OPERATORS:
             raise ValueError(f"Operator '{op}' is not allowed. Use one of: {ALLOWED_OPERATORS}")
 
-        # Bracket the column name to handle reserved words / spaces
         col_expr = f"[{col}]"
 
         if op in ("IS NULL", "IS NOT NULL"):
@@ -202,27 +183,6 @@ def health():
 
 # ===============================
 # QUERY ENDPOINT
-#
-# POST /query-data?table=<table>
-#
-# Request body (JSON):
-# {
-#   "filters": [
-#     {"column": "status",     "operator": "=",    "value": "active"},
-#     {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
-#     {"column": "region",     "operator": "IN",   "value": ["ZA", "NG"]},
-#     {"column": "deleted_at", "operator": "IS NULL"}
-#   ]
-# }
-#
-# Snowflake External Function response format:
-# {
-#   "data": [
-#     [0, {...row...}],   ← row index + row object
-#     [1, {...row...}],
-#     ...
-#   ]
-# }
 # ===============================
 @app.route("/query-data", methods=["POST"])
 def query_data():
@@ -252,7 +212,7 @@ def query_data():
         print(f"QUERY | table={target_table} | filters={len(filters)} | sql={sql}")
 
         conn   = get_connection()
-        cursor = conn.cursor(as_dict=True)   # returns rows as dicts
+        cursor = conn.cursor(as_dict=True)
 
         try:
             cursor.execute(sql, params) if params else cursor.execute(sql)
@@ -263,7 +223,6 @@ def query_data():
             invalidate_connection(conn)
             raise
 
-        # Serialise: datetimes → ISO strings, keep None as null
         def serialise(v):
             if isinstance(v, datetime):
                 return v.isoformat()
@@ -274,7 +233,6 @@ def query_data():
             for row in rows
         ]
 
-        # Snowflake External Function envelope: list of [row_index, value] pairs
         result = [[i, row] for i, row in enumerate(clean_rows)]
 
         duration = (datetime.now() - start_time).total_seconds()
@@ -324,8 +282,8 @@ def insert_data():
         print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | "
               f"batch={BATCH_SIZE} | truncate={do_truncate} | nocheck={do_nocheck}")
 
-        batches  = []
-        bad_rows = []
+        batches      = []
+        bad_rows     = []
         current_nums = []
         current_vals = []
 
@@ -397,6 +355,14 @@ def insert_data():
                     conn.rollback()
                     err = str(e)[:200]
                     print(f"  Batch FAILED: {err}")
+
+                    # ── DIAGNOSTIC: log column names + first row values ──────
+                    print(f"  Columns ({num_columns}): {columns}")
+                    first_row = list(flat_vals[:num_columns])
+                    for i, (col, val) in enumerate(zip(columns, first_row)):
+                        print(f"    [{i:02d}] {col} = {repr(val)} ({type(val).__name__})")
+                    # ──────────────────────────────────────────────────────────
+
                     total_errors += n
                     results.extend([rn, "ERROR", err] for rn in batch_nums)
 
