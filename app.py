@@ -108,6 +108,19 @@ def clean_value(v):
             return None
         if isinstance(v, pd.Timestamp):
             return v.strftime('%Y-%m-%d %H:%M:%S')
+        if isinstance(v, str):
+            stripped = v.strip()
+            if stripped == '':
+                return None          # empty string → NULL
+            try:
+                return int(stripped)
+            except ValueError:
+                pass
+            try:
+                return float(stripped)
+            except ValueError:
+                pass
+            return stripped          # leave as string if not numeric
         return v
     except (TypeError, ValueError):
         return None
