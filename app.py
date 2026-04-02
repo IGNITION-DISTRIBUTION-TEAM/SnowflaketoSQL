@@ -1,174 +1,438 @@
-CREATE OR REPLACE PROCEDURE DATAWAREHOUSE.DISTRIBUTION_AUTOMATION.SP_SYNC_FROM_SQLSERVER(
-    "SQL_SERVER_TABLE"  VARCHAR,   -- e.g. 'dbo.Orders'
-    "SNOWFLAKE_TARGET"  VARCHAR,   -- e.g. 'DATAWAREHOUSE.DISTRIBUTION_AUTOMATION.ORDERS_MIRROR'
-    "FILTERS_JSON"      VARCHAR    -- '[{"column":"status","operator":"=","value":"active"}]' or '[]'
-)
-RETURNS VARCHAR(16777216)
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
-PACKAGES = ('snowflake-snowpark-python','requests','pandas')
-HANDLER = 'main'
-EXTERNAL_ACCESS_INTEGRATIONS = (INT_SNOWFLAKETOSQL_INTERGRATION)
-SECRETS = ('api_token'=DATAWAREHOUSE.DISTRIBUTION_AUTOMATION.SNOWFLAKETOSQL_SECRET)
-EXECUTE AS OWNER
-AS '
-import requests
-import _snowflake
+from flask import Flask, request, jsonify
+import pymssql
+import os
 import pandas as pd
-import json
-from snowflake.snowpark import Session
 from datetime import datetime
-import time
+import threading
 
-RENDER_URL = "https://snowflaketosql-1.onrender.com"
+app = Flask(__name__)
 
+# ===============================
+# ENVIRONMENT VARIABLES
+# ===============================
+SQL_SERVER   = os.environ.get("SQL_SERVER")
+SQL_DATABASE = os.environ.get("SQL_DATABASE")
+SQL_USERNAME = os.environ.get("SQL_USERNAME")
+SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
+API_TOKEN    = os.environ.get("API_TOKEN")
 
-# ── FETCH FROM RENDER ─────────────────────────────────────────────────────────
+CONNECTION_TIMEOUT = 60
 
-def fetch_from_render(api_token: str, sql_table: str, filters: list) -> tuple:
-    url     = f"{RENDER_URL}/query-data?table={sql_table}"
-    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    payload = {"filters": filters}
+# ===============================
+# CONNECTION POOL
+# ===============================
+_pool      = []
+_pool_lock = threading.Lock()
+POOL_SIZE  = 3
 
-    for attempt in range(3):
+def _new_conn():
+    return pymssql.connect(
+        server=SQL_SERVER,
+        user=SQL_USERNAME,
+        password=SQL_PASSWORD,
+        database=SQL_DATABASE,
+        charset='UTF-8',
+        timeout=CONNECTION_TIMEOUT,
+        login_timeout=30
+    )
+
+def get_connection():
+    with _pool_lock:
+        while _pool:
+            conn = _pool.pop()
+            try:
+                conn.cursor().execute("SELECT 1")
+                return conn
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return _new_conn()
+
+def return_connection(conn):
+    with _pool_lock:
+        if len(_pool) < POOL_SIZE:
+            _pool.append(conn)
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def invalidate_connection(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def prewarm_pool():
+    if _pool:
+        return
+    print("=== ENV VAR CHECK ===")
+    print(f"  SQL_SERVER:   {'SET' if SQL_SERVER   else 'MISSING'} ({SQL_SERVER})")
+    print(f"  SQL_DATABASE: {'SET' if SQL_DATABASE else 'MISSING'} ({SQL_DATABASE})")
+    print(f"  SQL_USERNAME: {'SET' if SQL_USERNAME else 'MISSING'} ({SQL_USERNAME})")
+    print(f"  SQL_PASSWORD: {'SET' if SQL_PASSWORD else 'MISSING'} ({'***' if SQL_PASSWORD else 'MISSING'})")
+    print(f"  API_TOKEN:    {'SET' if API_TOKEN    else 'MISSING'}")
+    print("=====================")
+
+    if not all([SQL_SERVER, SQL_DATABASE, SQL_USERNAME, SQL_PASSWORD]):
+        print("ERROR: One or more required env vars are missing — skipping pool init")
+        return
+
+    print("Pre-warming connection pool...")
+    for _ in range(POOL_SIZE):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=600)
-            if r.status_code == 200:
-                raw  = r.json().get("data", [])
-                rows = [entry[1] for entry in raw]
-                return rows, None
-            error = f"HTTP {r.status_code}: {r.text[:300]}"
+            with _pool_lock:
+                _pool.append(_new_conn())
         except Exception as e:
-            error = str(e)
-        if attempt < 2:
-            time.sleep(2 ** attempt)
-
-    return [], error
+            print(f"Pool prewarm failed (will connect on demand): {e}")
+    print(f"Pool ready with {len(_pool)} connection(s).")
 
 
-# ── PARSE FULLY QUALIFIED TABLE NAME ─────────────────────────────────────────
-# Handles:
-#   3-part: DATABASE.SCHEMA.TABLE
-#   2-part: SCHEMA.TABLE          (uses session default database)
-#   1-part: TABLE                 (uses session defaults)
+# ===============================
+# HELPERS
+# ===============================
+def verify_token(req):
+    return req.headers.get("Authorization") == f"Bearer {API_TOKEN}"
 
-def parse_table_ref(fully_qualified: str) -> tuple:
-    parts = [p.strip().strip(''"`\'''') for p in fully_qualified.split(".")]
-    if len(parts) == 3:
-        return parts[0], parts[1], parts[2]
-    elif len(parts) == 2:
-        return None, parts[0], parts[1]
-    else:
-        return None, None, parts[0]
+def get_batch_size(num_columns):
+    return max(1, 2000 // num_columns)
 
-
-# ── WRITE TO SNOWFLAKE ────────────────────────────────────────────────────────
-
-def write_to_snowflake(session: Session, rows: list, target_table: str,
-                       results: list) -> tuple:
-    if not rows:
-        results.append("  No rows returned from SQL Server.")
-        return 0, 0
-
-    df = pd.DataFrame(rows)
-
-    # Uppercase column names to match Snowflake convention
-    df.columns = [c.upper() for c in df.columns]
-
-    results.append(f"  Columns ({len(df.columns)}): {list(df.columns)}")
-    results.append(f"  Rows fetched: {len(df):,}")
-
-    database, schema, table = parse_table_ref(target_table)
-
+def clean_value(v):
     try:
-        # DROP existing table so schema is always re-inferred cleanly from
-        # whatever columns SQL Server returns — no manual DDL needed.
-        session.sql(f"DROP TABLE IF EXISTS {target_table}").collect()
-        results.append(f"  Dropped existing {target_table} (if any)")
+        if v is None:
+            return None
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        if isinstance(v, pd.Timestamp):
+            return v.strftime('%Y-%m-%d %H:%M:%S')
+        return v
+    except (TypeError, ValueError):
+        return None
 
-        write_kwargs = dict(
-            df             = df,
-            table_name     = table,
-            overwrite      = True,    # recreate if it somehow still exists
-            auto_create_table = True, # infer schema from the DataFrame
-            quote_identifiers = False
-        )
-        if database:
-            write_kwargs["database"] = database
-        if schema:
-            write_kwargs["schema"] = schema
+# Allowlist of valid SQL comparison operators to prevent injection
+ALLOWED_OPERATORS = {"=", "!=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
 
-        session.write_pandas(**write_kwargs)
+def build_where_clause(filters):
+    """
+    Build a parameterised WHERE clause from a list of filter dicts.
 
-        results.append(f"  ✓ Table {target_table} created and loaded")
-        return len(df), 0
+    Each filter dict must have:
+        column   (str)  – column name
+        operator (str)  – one of ALLOWED_OPERATORS
+        value    (any)  – the value to compare against
+                          (ignored for IS NULL / IS NOT NULL)
 
-    except Exception as e:
-        results.append(f"  ERROR writing to Snowflake: {e}")
-        return 0, len(df)
+    Returns (where_str, params_tuple) or raises ValueError on bad input.
+
+    Example input:
+        [
+            {"column": "status",     "operator": "=",    "value": "active"},
+            {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
+            {"column": "deleted_at", "operator": "IS NULL"}
+        ]
+    """
+    if not filters:
+        return "", ()
+
+    clauses = []
+    params  = []
+
+    for f in filters:
+        col = f.get("column", "").strip()
+        op  = f.get("operator", "").strip().upper()
+
+        if not col:
+            raise ValueError("Each filter must include a 'column' field.")
+        if op not in ALLOWED_OPERATORS:
+            raise ValueError(f"Operator '{op}' is not allowed. Use one of: {ALLOWED_OPERATORS}")
+
+        # Bracket the column name to handle reserved words / spaces
+        col_expr = f"[{col}]"
+
+        if op in ("IS NULL", "IS NOT NULL"):
+            clauses.append(f"{col_expr} {op}")
+
+        elif op in ("IN", "NOT IN"):
+            values = f.get("value")
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"'value' for {op} must be a non-empty list.")
+            placeholders = ", ".join(["%s"] * len(values))
+            clauses.append(f"{col_expr} {op} ({placeholders})")
+            params.extend(values)
+
+        else:
+            clauses.append(f"{col_expr} {op} %s")
+            params.append(f.get("value"))
+
+    return "WHERE " + " AND ".join(clauses), tuple(params)
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+@app.before_request
+def initialize():
+    prewarm_pool()
 
-def main(session: Session,
-         SQL_SERVER_TABLE: str,
-         SNOWFLAKE_TARGET: str,
-         FILTERS_JSON: str):
 
-    api_token  = _snowflake.get_generic_secret_string("api_token")
+# ===============================
+# HEALTH CHECK
+# ===============================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "pool_size": len(_pool),
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
+
+
+# ===============================
+# QUERY ENDPOINT
+#
+# POST /query-data?table=<table>
+#
+# Request body (JSON):
+# {
+#   "filters": [
+#     {"column": "status",     "operator": "=",    "value": "active"},
+#     {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
+#     {"column": "region",     "operator": "IN",   "value": ["ZA", "NG"]},
+#     {"column": "deleted_at", "operator": "IS NULL"}
+#   ]
+# }
+#
+# Snowflake External Function response format:
+# {
+#   "data": [
+#     [0, {...row...}],   ← row index + row object
+#     [1, {...row...}],
+#     ...
+#   ]
+# }
+# ===============================
+@app.route("/query-data", methods=["POST"])
+def query_data():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
+
     start_time = datetime.now()
-    run_id     = start_time.strftime(''%Y%m%d_%H%M%S'')
-    results    = []
 
-    results.append("=" * 80)
-    results.append("SQL SERVER → SNOWFLAKE SYNC  (auto schema)")
-    results.append("=" * 80)
-    results.append(f"Run ID:           {run_id}")
-    results.append(f"Started:          {start_time.strftime(''%Y-%m-%d %H:%M:%S'')}")
-    results.append(f"SQL Server Table: {SQL_SERVER_TABLE}")
-    results.append(f"Snowflake Target: {SNOWFLAKE_TARGET}")
-    results.append(f"Filters:          {FILTERS_JSON}")
-    results.append("")
-
-    # ── 1. PARSE FILTERS ─────────────────────────────────────────────────────
     try:
-        filters = json.loads(FILTERS_JSON) if FILTERS_JSON else []
-        if not isinstance(filters, list):
-            raise ValueError("FILTERS_JSON must be a JSON array")
+        payload      = request.get_json() or {}
+        target_table = request.args.get("table")
+
+        if not target_table:
+            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
+
+        filters = payload.get("filters", [])
+
+        try:
+            where_clause, params = build_where_clause(filters)
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+        sql = f"SELECT * FROM {target_table}"
+        if where_clause:
+            sql += f" {where_clause}"
+
+        print(f"QUERY | table={target_table} | filters={len(filters)} | sql={sql}")
+
+        conn   = get_connection()
+        cursor = conn.cursor(as_dict=True)   # returns rows as dicts
+
+        try:
+            cursor.execute(sql, params) if params else cursor.execute(sql)
+            rows = cursor.fetchall()
+            cursor.close()
+            return_connection(conn)
+        except Exception as e:
+            invalidate_connection(conn)
+            raise
+
+        # Serialise: datetimes → ISO strings, keep None as null
+        def serialise(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return v
+
+        clean_rows = [
+            {k: serialise(v) for k, v in row.items()}
+            for row in rows
+        ]
+
+        # Snowflake External Function envelope: list of [row_index, value] pairs
+        result = [[i, row] for i, row in enumerate(clean_rows)]
+
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"QUERY DONE | {len(rows)} rows | {duration:.2f}s")
+
+        return jsonify({"data": result}), 200
+
     except Exception as e:
-        return f"Invalid FILTERS_JSON: {e}"
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"QUERY ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
 
-    results.append(f"Parsed {len(filters)} filter(s).")
 
-    # ── 2. FETCH FROM SQL SERVER VIA RENDER ───────────────────────────────────
-    results.append("Fetching data from SQL Server...")
-    fetch_start = datetime.now()
-    rows, error = fetch_from_render(api_token, SQL_SERVER_TABLE, filters)
-    fetch_sec   = (datetime.now() - fetch_start).total_seconds()
+# ===============================
+# INSERT ENDPOINT
+# ===============================
+@app.route("/insert-data", methods=["POST"])
+def insert_data():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
 
-    if error:
-        results.append(f"✗ Fetch failed after {fetch_sec:.1f}s: {error}")
-        return "\\n".join(results)
+    start_time = datetime.now()
 
-    results.append(f"✓ Fetched {len(rows):,} rows in {fetch_sec:.1f}s")
-    results.append("")
+    try:
+        payload = request.get_json()
+        if not payload or "data" not in payload:
+            return jsonify({"statusCode": 400, "body": "Invalid payload"}), 400
 
-    # ── 3. WRITE TO SNOWFLAKE (auto DDL) ─────────────────────────────────────
-    results.append(f"Writing to {SNOWFLAKE_TARGET}...")
-    written, failed = write_to_snowflake(session, rows, SNOWFLAKE_TARGET, results)
+        rows_data     = payload["data"]
+        target_table  = request.args.get("table")
+        columns_param = request.args.get("columns")
+        do_truncate   = request.args.get("truncate", "false").lower() == "true"
+        do_nocheck    = request.args.get("nocheck",  "true" ).lower() == "true"
 
-    # ── SUMMARY ───────────────────────────────────────────────────────────────
-    duration = (datetime.now() - start_time).total_seconds()
-    results.append("")
-    results.append("=" * 80)
-    results.append("SYNC SUMMARY")
-    results.append("=" * 80)
-    results.append(f"Rows Fetched:  {len(rows):,}")
-    results.append(f"Rows Written:  {written:,}")
-    results.append(f"Rows Failed:   {failed:,}")
-    results.append(f"Duration:      {duration:.1f}s ({duration/60:.1f} min)")
-    results.append(f"Avg Rate:      {written / max(duration, 1):.0f} rows/sec")
-    results.append("=" * 80)
+        if not target_table or not columns_param:
+            return jsonify({"statusCode": 400, "body": "Missing table or columns"}), 400
 
-    return "\\n".join(results)
-';
+        if not rows_data:
+            return jsonify({"data": []}), 200
+
+        columns     = [c.strip() for c in columns_param.split(",")]
+        num_columns = len(columns)
+        BATCH_SIZE  = get_batch_size(num_columns)
+        columns_str = ", ".join(f"[{c}]" for c in columns)
+        total_rows  = len(rows_data)
+
+        print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | "
+              f"batch={BATCH_SIZE} | truncate={do_truncate} | nocheck={do_nocheck}")
+
+        batches  = []
+        bad_rows = []
+        current_nums = []
+        current_vals = []
+
+        for row in rows_data:
+            row_num     = row[0]
+            data_values = row[1:]
+
+            if len(data_values) != num_columns:
+                bad_rows.append((row_num, f"Column mismatch: expected {num_columns}, got {len(data_values)}"))
+                continue
+
+            current_nums.append(row_num)
+            current_vals.extend(clean_value(v) for v in data_values)
+
+            if len(current_nums) == BATCH_SIZE:
+                batches.append((list(current_nums), tuple(current_vals)))
+                current_nums = []
+                current_vals = []
+
+        if current_nums:
+            batches.append((current_nums, tuple(current_vals)))
+
+        conn    = get_connection()
+        cursor  = conn.cursor()
+        results = []
+        total_inserted = 0
+        total_errors   = 0
+
+        try:
+            if do_truncate:
+                print(f"  Truncating {target_table}...")
+                cursor.execute(f"TRUNCATE TABLE {target_table}")
+                conn.commit()
+
+            if do_nocheck:
+                print(f"  Disabling constraints and indexes...")
+                cursor.execute(f"ALTER TABLE {target_table} NOCHECK CONSTRAINT ALL")
+                conn.commit()
+                cursor.execute(f"""
+                    DECLARE @sql NVARCHAR(MAX) = '';
+                    SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} DISABLE;'
+                    FROM sys.indexes i
+                    WHERE i.object_id = OBJECT_ID('{target_table}')
+                      AND i.type_desc = 'NONCLUSTERED'
+                      AND i.is_disabled = 0;
+                    EXEC sp_executesql @sql;
+                """)
+                conn.commit()
+
+            for batch_nums, flat_vals in batches:
+                n = len(batch_nums)
+                row_placeholders = ", ".join(
+                    "(" + ", ".join(["%s"] * num_columns) + ")"
+                    for _ in range(n)
+                )
+                sql = (
+                    f"INSERT INTO {target_table} WITH (TABLOCK) "
+                    f"({columns_str}) VALUES {row_placeholders}"
+                )
+                t0 = datetime.now()
+                try:
+                    cursor.execute(sql, flat_vals)
+                    conn.commit()
+                    exec_ms = (datetime.now() - t0).total_seconds() * 1000
+                    total_inserted += n
+                    results.extend([rn, "SUCCESS", None] for rn in batch_nums)
+                    print(f"  Batch {n} rows | {exec_ms:.0f}ms | total {total_inserted}/{total_rows}")
+                except Exception as e:
+                    conn.rollback()
+                    err = str(e)[:200]
+                    print(f"  Batch FAILED: {err}")
+                    total_errors += n
+                    results.extend([rn, "ERROR", err] for rn in batch_nums)
+
+            if do_nocheck:
+                print(f"  Re-enabling constraints and rebuilding indexes...")
+                cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
+                conn.commit()
+                cursor.execute(f"""
+                    DECLARE @sql NVARCHAR(MAX) = '';
+                    SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} REBUILD;'
+                    FROM sys.indexes i
+                    WHERE i.object_id = OBJECT_ID('{target_table}')
+                      AND i.type_desc = 'NONCLUSTERED'
+                      AND i.is_disabled = 1;
+                    EXEC sp_executesql @sql;
+                """)
+                conn.commit()
+
+            cursor.close()
+            return_connection(conn)
+
+        except Exception:
+            try:
+                cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
+                conn.commit()
+            except Exception:
+                pass
+            invalidate_connection(conn)
+            raise
+
+        for rn, err in bad_rows:
+            results.append([rn, "ERROR", err])
+            total_errors += 1
+
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"DONE | {total_inserted} inserted | {total_errors} errors | "
+              f"{duration:.2f}s | {total_rows / max(duration, 0.01):.0f} rows/s")
+
+        return jsonify({"data": results}), 200
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"CRITICAL ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
+
+# ===============================
+# APP START
+# ===============================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
