@@ -384,12 +384,15 @@ def insert_data():
             cursor.close()
             return_connection(conn)
 
-        except Exception:
+        except Exception as outer_ex:
+            print(f"  OUTER EXCEPTION: {outer_ex}")
+            import traceback
+            traceback.print_exc()
             try:
                 cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
                 conn.commit()
-            except Exception:
-                pass
+            except Exception as re_ex:
+                print(f"  RE-ENABLE CONSTRAINTS FAILED: {re_ex}")
             invalidate_connection(conn)
             raise
 
