@@ -37,12 +37,10 @@ def _new_conn():
     )
 
 def get_connection():
-    """Return a pooled connection, validating it before use."""
     with _pool_lock:
         while _pool:
             conn = _pool.pop()
             try:
-                # Ping to confirm connection is still alive
                 conn.cursor().execute("SELECT 1")
                 return conn
             except Exception:
@@ -69,10 +67,8 @@ def invalidate_connection(conn):
         pass
 
 def prewarm_pool():
-    """Called on first request once env vars are guaranteed to be loaded."""
     if _pool:
         return
-    # ── Diagnose env vars before attempting connection ────────────────────
     print("=== ENV VAR CHECK ===")
     print(f"  SQL_SERVER:   {'SET' if SQL_SERVER   else 'MISSING'} ({SQL_SERVER})")
     print(f"  SQL_DATABASE: {'SET' if SQL_DATABASE else 'MISSING'} ({SQL_DATABASE})")
@@ -102,7 +98,6 @@ def verify_token(req):
     return req.headers.get("Authorization") == f"Bearer {API_TOKEN}"
 
 def get_batch_size(num_columns):
-    """Stay under SQL Server 2012's 2100 parameter limit."""
     return max(1, 2000 // num_columns)
 
 def clean_value(v):
@@ -117,10 +112,66 @@ def clean_value(v):
     except (TypeError, ValueError):
         return None
 
+# Allowlist of valid SQL comparison operators to prevent injection
+ALLOWED_OPERATORS = {"=", "!=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
+
+def build_where_clause(filters):
+    """
+    Build a parameterised WHERE clause from a list of filter dicts.
+
+    Each filter dict must have:
+        column   (str)  – column name
+        operator (str)  – one of ALLOWED_OPERATORS
+        value    (any)  – the value to compare against
+                          (ignored for IS NULL / IS NOT NULL)
+
+    Returns (where_str, params_tuple) or raises ValueError on bad input.
+
+    Example input:
+        [
+            {"column": "status",     "operator": "=",    "value": "active"},
+            {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
+            {"column": "deleted_at", "operator": "IS NULL"}
+        ]
+    """
+    if not filters:
+        return "", ()
+
+    clauses = []
+    params  = []
+
+    for f in filters:
+        col = f.get("column", "").strip()
+        op  = f.get("operator", "").strip().upper()
+
+        if not col:
+            raise ValueError("Each filter must include a 'column' field.")
+        if op not in ALLOWED_OPERATORS:
+            raise ValueError(f"Operator '{op}' is not allowed. Use one of: {ALLOWED_OPERATORS}")
+
+        # Bracket the column name to handle reserved words / spaces
+        col_expr = f"[{col}]"
+
+        if op in ("IS NULL", "IS NOT NULL"):
+            clauses.append(f"{col_expr} {op}")
+
+        elif op in ("IN", "NOT IN"):
+            values = f.get("value")
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"'value' for {op} must be a non-empty list.")
+            placeholders = ", ".join(["%s"] * len(values))
+            clauses.append(f"{col_expr} {op} ({placeholders})")
+            params.extend(values)
+
+        else:
+            clauses.append(f"{col_expr} {op} %s")
+            params.append(f.get("value"))
+
+    return "WHERE " + " AND ".join(clauses), tuple(params)
+
 
 @app.before_request
 def initialize():
-    """Lazy pool init — runs once after Render has loaded all env vars."""
     prewarm_pool()
 
 
@@ -137,10 +188,95 @@ def health():
 
 
 # ===============================
+# QUERY ENDPOINT
+#
+# POST /query-data?table=<table>
+#
+# Request body (JSON):
+# {
+#   "filters": [
+#     {"column": "status",     "operator": "=",    "value": "active"},
+#     {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
+#     {"column": "region",     "operator": "IN",   "value": ["ZA", "NG"]},
+#     {"column": "deleted_at", "operator": "IS NULL"}
+#   ]
+# }
+#
+# Snowflake External Function response format:
+# {
+#   "data": [
+#     [0, {...row...}],   ← row index + row object
+#     [1, {...row...}],
+#     ...
+#   ]
+# }
+# ===============================
+@app.route("/query-data", methods=["POST"])
+def query_data():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
+
+    start_time = datetime.now()
+
+    try:
+        payload      = request.get_json() or {}
+        target_table = request.args.get("table")
+
+        if not target_table:
+            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
+
+        filters = payload.get("filters", [])
+
+        try:
+            where_clause, params = build_where_clause(filters)
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+        sql = f"SELECT * FROM {target_table}"
+        if where_clause:
+            sql += f" {where_clause}"
+
+        print(f"QUERY | table={target_table} | filters={len(filters)} | sql={sql}")
+
+        conn   = get_connection()
+        cursor = conn.cursor(as_dict=True)   # returns rows as dicts
+
+        try:
+            cursor.execute(sql, params) if params else cursor.execute(sql)
+            rows = cursor.fetchall()
+            cursor.close()
+            return_connection(conn)
+        except Exception as e:
+            invalidate_connection(conn)
+            raise
+
+        # Serialise: datetimes → ISO strings, keep None as null
+        def serialise(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return v
+
+        clean_rows = [
+            {k: serialise(v) for k, v in row.items()}
+            for row in rows
+        ]
+
+        # Snowflake External Function envelope: list of [row_index, value] pairs
+        result = [[i, row] for i, row in enumerate(clean_rows)]
+
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"QUERY DONE | {len(rows)} rows | {duration:.2f}s")
+
+        return jsonify({"data": result}), 200
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"QUERY ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
+
+# ===============================
 # INSERT ENDPOINT
-# Optional query params:
-#   truncate=true   → TRUNCATE TABLE before inserting (full reload)
-#   nocheck=true    → Disable constraints during load (default: true)
 # ===============================
 @app.route("/insert-data", methods=["POST"])
 def insert_data():
@@ -175,10 +311,8 @@ def insert_data():
         print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | "
               f"batch={BATCH_SIZE} | truncate={do_truncate} | nocheck={do_nocheck}")
 
-        # ── VALIDATE + CLEAN ALL ROWS BEFORE TOUCHING THE DB ────────────────
         batches  = []
         bad_rows = []
-
         current_nums = []
         current_vals = []
 
@@ -201,33 +335,22 @@ def insert_data():
         if current_nums:
             batches.append((current_nums, tuple(current_vals)))
 
-        # ── SINGLE CONNECTION FOR ENTIRE REQUEST ─────────────────────────────
         conn    = get_connection()
         cursor  = conn.cursor()
         results = []
-
         total_inserted = 0
         total_errors   = 0
 
         try:
-            # ── OPTIONAL: TRUNCATE FIRST (full reload mode) ──────────────────
             if do_truncate:
                 print(f"  Truncating {target_table}...")
                 cursor.execute(f"TRUNCATE TABLE {target_table}")
                 conn.commit()
-                print(f"  Truncated.")
 
-            # ── DISABLE CONSTRAINTS + INDEXES FOR BULK LOAD ──────────────────
-            # ALTER TABLE NOCHECK disables FK and CHECK constraints.
-            # DISABLE on indexes stops index maintenance during insert —
-            # they are rebuilt in one pass at the end via ALTER INDEX REBUILD,
-            # which is far faster than updating the index on every row.
             if do_nocheck:
                 print(f"  Disabling constraints and indexes...")
                 cursor.execute(f"ALTER TABLE {target_table} NOCHECK CONSTRAINT ALL")
                 conn.commit()
-
-                # Disable all non-clustered indexes
                 cursor.execute(f"""
                     DECLARE @sql NVARCHAR(MAX) = '';
                     SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} DISABLE;'
@@ -238,32 +361,25 @@ def insert_data():
                     EXEC sp_executesql @sql;
                 """)
                 conn.commit()
-                print(f"  Constraints and indexes disabled.")
 
-            # ── BULK INSERT ALL BATCHES ───────────────────────────────────────
             for batch_nums, flat_vals in batches:
                 n = len(batch_nums)
                 row_placeholders = ", ".join(
                     "(" + ", ".join(["%s"] * num_columns) + ")"
                     for _ in range(n)
                 )
-                # TABLOCK: acquires a table-level lock for the duration of the
-                # insert — avoids row-level lock escalation overhead.
                 sql = (
                     f"INSERT INTO {target_table} WITH (TABLOCK) "
                     f"({columns_str}) VALUES {row_placeholders}"
                 )
-
                 t0 = datetime.now()
                 try:
                     cursor.execute(sql, flat_vals)
                     conn.commit()
                     exec_ms = (datetime.now() - t0).total_seconds() * 1000
-
                     total_inserted += n
                     results.extend([rn, "SUCCESS", None] for rn in batch_nums)
                     print(f"  Batch {n} rows | {exec_ms:.0f}ms | total {total_inserted}/{total_rows}")
-
                 except Exception as e:
                     conn.rollback()
                     err = str(e)[:200]
@@ -271,15 +387,10 @@ def insert_data():
                     total_errors += n
                     results.extend([rn, "ERROR", err] for rn in batch_nums)
 
-            # ── RE-ENABLE CONSTRAINTS + REBUILD INDEXES ───────────────────────
-            # Rebuilding indexes in one pass after load is 5-10x faster than
-            # maintaining them incrementally during insert.
             if do_nocheck:
                 print(f"  Re-enabling constraints and rebuilding indexes...")
-
                 cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
                 conn.commit()
-
                 cursor.execute(f"""
                     DECLARE @sql NVARCHAR(MAX) = '';
                     SELECT @sql += 'ALTER INDEX [' + i.name + '] ON {target_table} REBUILD;'
@@ -290,13 +401,11 @@ def insert_data():
                     EXEC sp_executesql @sql;
                 """)
                 conn.commit()
-                print(f"  Constraints re-enabled and indexes rebuilt.")
 
             cursor.close()
             return_connection(conn)
 
         except Exception:
-            # Make sure we always re-enable constraints even on crash
             try:
                 cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
                 conn.commit()
@@ -305,7 +414,6 @@ def insert_data():
             invalidate_connection(conn)
             raise
 
-        # Add pre-validation errors
         for rn, err in bad_rows:
             results.append([rn, "ERROR", err])
             total_errors += 1
