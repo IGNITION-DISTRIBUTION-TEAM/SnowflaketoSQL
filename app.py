@@ -387,6 +387,131 @@ def aggregate_data():
 
 
 # ===============================
+# DELETE ENDPOINT
+#
+# POST /delete-data?table=<table>
+#
+# Request body (JSON) - Two options:
+#
+# Option 1: Delete by filter conditions
+# {
+#   "filters": [
+#     {"column": "TEMPUPLOADID", "operator": "NOT IN", "value": [1, 2, 3]},
+#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"}
+#   ]
+# }
+#
+# Option 2: Delete duplicates (keep max ID for each partition)
+# {
+#   "delete_duplicates": true,
+#   "partition_by": ["CELLNUMBER"],
+#   "order_by": "TEMPUPLOADID DESC",
+#   "filters": [
+#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"}
+#   ]
+# }
+#
+# Response format:
+# {
+#   "statusCode": 200,
+#   "rows_deleted": 42,
+#   "message": "Successfully deleted 42 rows"
+# }
+# ===============================
+@app.route("/delete-data", methods=["POST"])
+def delete_data():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
+
+    start_time = datetime.now()
+
+    try:
+        payload      = request.get_json() or {}
+        target_table = request.args.get("table")
+
+        if not target_table:
+            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
+
+        delete_duplicates = payload.get("delete_duplicates", False)
+        filters = payload.get("filters", [])
+
+        try:
+            where_clause, params = build_where_clause(filters)
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        try:
+            if delete_duplicates:
+                # Delete duplicates - keep only the MAX ID for each partition
+                partition_by = payload.get("partition_by", [])
+                order_by = payload.get("order_by", "TEMPUPLOADID DESC")
+
+                if not partition_by:
+                    return jsonify({"statusCode": 400, "body": "partition_by required for delete_duplicates"}), 400
+
+                partition_expr = ", ".join(f"[{col}]" for col in partition_by)
+                
+                delete_sql = f"""
+                    DELETE FROM {target_table}
+                    WHERE [TEMPUPLOADID] NOT IN (
+                        SELECT MAX([TEMPUPLOADID])
+                        FROM {target_table}
+                        GROUP BY {partition_expr}
+                    )
+                """
+                
+                if where_clause:
+                    delete_sql += f" AND {where_clause}"
+                
+                print(f"DELETE DUPLICATES | table={target_table} | partition_by={partition_by} | sql={delete_sql}")
+                
+                cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
+                conn.commit()
+                rows_deleted = cursor.rowcount
+
+            else:
+                # Standard delete with filters
+                delete_sql = f"DELETE FROM {target_table}"
+                
+                if where_clause:
+                    delete_sql += f" {where_clause}"
+                else:
+                    return jsonify({"statusCode": 400, "body": "No filters provided for delete"}), 400
+
+                print(f"DELETE | table={target_table} | filters={len(filters)} | sql={delete_sql}")
+                
+                cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
+                conn.commit()
+                rows_deleted = cursor.rowcount
+
+            cursor.close()
+            return_connection(conn)
+
+            duration = (datetime.now() - start_time).total_seconds()
+            print(f"DELETE DONE | {rows_deleted} rows deleted | {duration:.2f}s")
+
+            return jsonify({
+                "statusCode": 200,
+                "rows_deleted": rows_deleted,
+                "message": f"Successfully deleted {rows_deleted} rows",
+                "duration_seconds": duration
+            }), 200
+
+        except Exception as e:
+            conn.rollback()
+            invalidate_connection(conn)
+            raise
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"DELETE ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
+
+# ===============================
 # INSERT ENDPOINT
 # ===============================
 @app.route("/insert-data", methods=["POST"])
