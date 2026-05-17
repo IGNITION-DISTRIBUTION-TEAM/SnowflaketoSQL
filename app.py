@@ -202,7 +202,7 @@ def health():
 #   ]
 # }
 #
-# Snowflake External Function response format:
+# Response format:
 # {
 #   "data": [
 #     [0, {...row...}],   ← row index + row object
@@ -233,19 +233,21 @@ def query_data():
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
         sql = f"SELECT * FROM {target_table}"
+        
         if where_clause:
             sql += f" {where_clause}"
 
         print(f"QUERY | table={target_table} | filters={len(filters)} | sql={sql}")
 
         conn   = get_connection()
-        cursor = conn.cursor(as_dict=True)   # returns rows as dicts
+        cursor = conn.cursor(as_dict=True)
 
         try:
             cursor.execute(sql, params) if params else cursor.execute(sql)
             rows = cursor.fetchall()
             cursor.close()
             return_connection(conn)
+
         except Exception as e:
             invalidate_connection(conn)
             raise
@@ -272,6 +274,115 @@ def query_data():
     except Exception as e:
         duration = (datetime.now() - start_time).total_seconds()
         print(f"QUERY ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
+
+# ===============================
+# AGGREGATE ENDPOINT (GROUP BY)
+#
+# POST /aggregate-data?table=<table>
+#
+# Request body (JSON):
+# {
+#   "select_columns": ["COUNT(1) AS count", "BATCHNAME", "SYSTEMMESSAGE"],
+#   "group_by": ["BATCHNAME", "SYSTEMMESSAGE"],
+#   "filters": [
+#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"},
+#     {"column": "createdondate", "operator": ">=", "value": "2024-01-15"}
+#   ]
+# }
+#
+# Response format:
+# {
+#   "data": [
+#     [0, {"count": 42, "BATCHNAME": "BATCH_001", "SYSTEMMESSAGE": null}],
+#     [1, {"count": 15, "BATCHNAME": "BATCH_002", "SYSTEMMESSAGE": null}],
+#     ...
+#   ]
+# }
+# ===============================
+@app.route("/aggregate-data", methods=["POST"])
+def aggregate_data():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
+
+    start_time = datetime.now()
+
+    try:
+        payload      = request.get_json() or {}
+        target_table = request.args.get("table")
+
+        if not target_table:
+            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
+
+        select_columns = payload.get("select_columns", [])
+        group_by_cols  = payload.get("group_by", [])
+        filters        = payload.get("filters", [])
+
+        if not select_columns:
+            return jsonify({
+                "statusCode": 400, 
+                "body": "Missing 'select_columns' for aggregate query"
+            }), 400
+
+        if not group_by_cols:
+            return jsonify({
+                "statusCode": 400, 
+                "body": "Missing 'group_by' for aggregate query"
+            }), 400
+
+        try:
+            where_clause, params = build_where_clause(filters)
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+        # Bracket all GROUP BY columns to handle reserved words
+        group_by_expr = ", ".join(f"[{col}]" for col in group_by_cols)
+        
+        sql = f"SELECT {', '.join(select_columns)} FROM {target_table}"
+        
+        if where_clause:
+            sql += f" {where_clause}"
+        
+        sql += f" GROUP BY {group_by_expr}"
+
+        print(f"AGGREGATE | table={target_table} | filters={len(filters)} | group_by={len(group_by_cols)} | sql={sql}")
+
+        conn   = get_connection()
+        cursor = conn.cursor(as_dict=True)
+
+        try:
+            cursor.execute(sql, params) if params else cursor.execute(sql)
+            rows = cursor.fetchall()
+            cursor.close()
+            return_connection(conn)
+
+        except Exception as e:
+            invalidate_connection(conn)
+            raise
+
+        # Serialise: datetimes → ISO strings, keep None as null
+        def serialise(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return v
+
+        clean_rows = [
+            {k: serialise(v) for k, v in row.items()}
+            for row in rows
+        ]
+
+        # Snowflake External Function envelope: list of [row_index, value] pairs
+        result = [[i, row] for i, row in enumerate(clean_rows)]
+
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"AGGREGATE DONE | {len(rows)} result rows | {duration:.2f}s")
+
+        return jsonify({"data": result}), 200
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"AGGREGATE ERROR after {duration:.2f}s: {e}")
         return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
 
 
