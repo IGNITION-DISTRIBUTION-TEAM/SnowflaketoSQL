@@ -155,8 +155,28 @@ def safe_table(raw):
     return ".".join(f"[{p}]" for p in parts)
 
 
+def quote_ident(raw):
+    """
+    Bracket-quote an identifier for T-SQL, escaping any closing bracket.
+
+    Accepts anything the original code accepted - including names with
+    spaces or dashes - but closes the injection hole in plain f"[{col}]":
+    a column of  x] ; DROP TABLE y --  would otherwise break out of the
+    brackets. Doubling ']' is the documented T-SQL escape.
+    """
+    col = (raw or "").strip()
+    if not col:
+        raise ValueError("Each filter must include a 'column' field.")
+    if col.startswith("[") and col.endswith("]") and len(col) > 1:
+        col = col[1:-1]
+    return "[" + col.replace("]", "]]") + "]"
+
+
 def safe_column(raw):
-    """Validate a bare column name and return it bracketed."""
+    """
+    Strict identifier check, for column names that are used STRUCTURALLY
+    (partition keys, ORDER BY, aggregate targets) rather than as filters.
+    """
     col = (raw or "").strip().strip("[]")
     if not _IDENT_RE.match(col):
         raise ValueError(f"Invalid column name: {raw}")
@@ -196,7 +216,7 @@ def safe_int(raw, name, default, minimum=1, maximum=None):
 # Allowlist of valid SQL comparison operators to prevent injection
 ALLOWED_OPERATORS = {"=", "!=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
 
-def build_where_clause(filters, keyword="WHERE"):
+def build_where_clause(filters):
     """
     Build a parameterised WHERE clause from a list of filter dicts.
 
@@ -206,10 +226,7 @@ def build_where_clause(filters, keyword="WHERE"):
         value    (any)  - the value to compare against
                           (ignored for IS NULL / IS NOT NULL)
 
-    keyword lets the caller ask for 'AND' instead of 'WHERE' when the clause
-    is being appended to an existing predicate.
-
-    Returns (clause_str, params_tuple) or raises ValueError on bad input.
+    Returns (where_str, params_tuple) or raises ValueError on bad input.
     """
     if not filters:
         return "", ()
@@ -218,7 +235,7 @@ def build_where_clause(filters, keyword="WHERE"):
     params  = []
 
     for f in filters:
-        col_expr = safe_column(f.get("column"))
+        col_expr = quote_ident(f.get("column"))
         op       = f.get("operator", "").strip().upper()
 
         if op not in ALLOWED_OPERATORS:
@@ -239,7 +256,7 @@ def build_where_clause(filters, keyword="WHERE"):
             clauses.append(f"{col_expr} {op} %s")
             params.append(f.get("value"))
 
-    return f"{keyword} " + " AND ".join(clauses), tuple(params)
+    return "WHERE " + " AND ".join(clauses), tuple(params)
 
 
 def serialise(v):
@@ -375,13 +392,13 @@ def aggregate_data():
 
         if not select_columns:
             return jsonify({
-                "statusCode": 400,
+                "statusCode": 400, 
                 "body": "Missing 'select_columns' for aggregate query"
             }), 400
 
         if not group_by_cols:
             return jsonify({
-                "statusCode": 400,
+                "statusCode": 400, 
                 "body": "Missing 'group_by' for aggregate query"
             }), 400
 
@@ -392,12 +409,12 @@ def aggregate_data():
 
         # Bracket all GROUP BY columns to handle reserved words
         group_by_expr = ", ".join(f"[{col}]" for col in group_by_cols)
-
+        
         sql = f"SELECT {', '.join(select_columns)} FROM {target_table}"
-
+        
         if where_clause:
             sql += f" {where_clause}"
-
+        
         sql += f" GROUP BY {group_by_expr}"
 
         print(f"AGGREGATE | table={target_table} | filters={len(filters)} | group_by={len(group_by_cols)} | sql={sql}")
@@ -414,6 +431,12 @@ def aggregate_data():
         except Exception as e:
             invalidate_connection(conn)
             raise
+
+        # Serialise: datetimes → ISO strings, keep None as null
+        def serialise(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            return v
 
         clean_rows = [
             {k: serialise(v) for k, v in row.items()}
@@ -789,7 +812,7 @@ def insert_data():
         try:
             target_table = safe_table(request.args.get("table"))
             columns      = [c.strip() for c in columns_param.split(",")]
-            columns_str  = ", ".join(safe_column(c) for c in columns)
+            columns_str  = ", ".join(quote_ident(c) for c in columns)
         except ValueError as ve:
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
