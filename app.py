@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import pymssql
 import os
+import re
 import pandas as pd
 from datetime import datetime
 import threading
@@ -15,6 +16,14 @@ SQL_DATABASE = os.environ.get("SQL_DATABASE")
 SQL_USERNAME = os.environ.get("SQL_USERNAME")
 SQL_PASSWORD = os.environ.get("SQL_PASSWORD")
 API_TOKEN    = os.environ.get("API_TOKEN")
+
+# Optional comma-separated allowlist, e.g. "Upload.TempUpload,Upload.Batches"
+# If unset, any syntactically valid table name is accepted (previous behaviour).
+ALLOWED_TABLES = {
+    t.strip().lower()
+    for t in (os.environ.get("ALLOWED_TABLES") or "").split(",")
+    if t.strip()
+}
 
 CONNECTION_TIMEOUT = 60
 
@@ -75,10 +84,11 @@ def prewarm_pool():
     print(f"  SQL_USERNAME: {'SET' if SQL_USERNAME else 'MISSING'} ({SQL_USERNAME})")
     print(f"  SQL_PASSWORD: {'SET' if SQL_PASSWORD else 'MISSING'} ({'***' if SQL_PASSWORD else 'MISSING'})")
     print(f"  API_TOKEN:    {'SET' if API_TOKEN    else 'MISSING'}")
+    print(f"  ALLOWED_TABLES: {sorted(ALLOWED_TABLES) if ALLOWED_TABLES else 'UNRESTRICTED'}")
     print("=====================")
 
     if not all([SQL_SERVER, SQL_DATABASE, SQL_USERNAME, SQL_PASSWORD]):
-        print("ERROR: One or more required env vars are missing — skipping pool init")
+        print("ERROR: One or more required env vars are missing - skipping pool init")
         return
 
     print("Pre-warming connection pool...")
@@ -112,27 +122,92 @@ def clean_value(v):
     except (TypeError, ValueError):
         return None
 
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def safe_table(raw):
+    """
+    Validate and re-bracket a table reference.
+
+    Accepts  'TempUpload' | 'Upload.TempUpload' | 'MyDb.Upload.TempUpload'
+    Returns  '[Upload].[TempUpload]'
+    Raises   ValueError on anything else.
+
+    A table name cannot be parameterised, so it is validated rather than bound.
+    """
+    if not raw:
+        raise ValueError("Missing 'table' query param")
+
+    parts = [p.strip().strip("[]") for p in raw.split(".")]
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(f"Invalid table reference: {raw}")
+    for p in parts:
+        if not _IDENT_RE.match(p):
+            raise ValueError(f"Invalid identifier in table reference: {p}")
+
+    if ALLOWED_TABLES and raw.strip().lower() not in ALLOWED_TABLES:
+        raise ValueError(f"Table '{raw}' is not in ALLOWED_TABLES")
+
+    return ".".join(f"[{p}]" for p in parts)
+
+
+def safe_column(raw):
+    """Validate a bare column name and return it bracketed."""
+    col = (raw or "").strip().strip("[]")
+    if not _IDENT_RE.match(col):
+        raise ValueError(f"Invalid column name: {raw}")
+    return f"[{col}]"
+
+
+_ORDER_BY_RE = re.compile(r"^\s*\[?([A-Za-z_][A-Za-z0-9_]*)\]?\s*(ASC|DESC)?\s*$", re.I)
+
+def safe_order_by(raw):
+    """
+    Validate an ORDER BY of the form '<column> [ASC|DESC]'.
+    Returns '[COLUMN] DESC'. Raises ValueError otherwise.
+    """
+    m = _ORDER_BY_RE.match(raw or "")
+    if not m:
+        raise ValueError(
+            f"Invalid order_by: {raw!r}. Expected '<column> [ASC|DESC]'."
+        )
+    return f"[{m.group(1)}] {(m.group(2) or 'DESC').upper()}"
+
+
+# Only aggregate predicates of the form COUNT(1) > 1 are permitted.
+_HAVING_RE = re.compile(
+    r"^\s*(COUNT)\s*\(\s*(1|\*)\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*(\d+)\s*$", re.I
+)
+
+def safe_having(raw):
+    """Validate an optional HAVING clause. Returns '' or 'HAVING COUNT(1) > 1'."""
+    if not raw:
+        return ""
+    m = _HAVING_RE.match(raw)
+    if not m:
+        raise ValueError(
+            f"Invalid having: {raw!r}. Only 'COUNT(1) <op> <number>' is supported."
+        )
+    return f"HAVING COUNT({m.group(2)}) {m.group(3)} {m.group(4)}"
+
+
 # Allowlist of valid SQL comparison operators to prevent injection
 ALLOWED_OPERATORS = {"=", "!=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "NOT IN", "IS NULL", "IS NOT NULL"}
 
-def build_where_clause(filters):
+def build_where_clause(filters, keyword="WHERE"):
     """
     Build a parameterised WHERE clause from a list of filter dicts.
 
     Each filter dict must have:
-        column   (str)  – column name
-        operator (str)  – one of ALLOWED_OPERATORS
-        value    (any)  – the value to compare against
+        column   (str)  - column name
+        operator (str)  - one of ALLOWED_OPERATORS
+        value    (any)  - the value to compare against
                           (ignored for IS NULL / IS NOT NULL)
 
-    Returns (where_str, params_tuple) or raises ValueError on bad input.
+    keyword lets the caller ask for 'AND' instead of 'WHERE' when the clause
+    is being appended to an existing predicate.
 
-    Example input:
-        [
-            {"column": "status",     "operator": "=",    "value": "active"},
-            {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
-            {"column": "deleted_at", "operator": "IS NULL"}
-        ]
+    Returns (clause_str, params_tuple) or raises ValueError on bad input.
     """
     if not filters:
         return "", ()
@@ -141,16 +216,11 @@ def build_where_clause(filters):
     params  = []
 
     for f in filters:
-        col = f.get("column", "").strip()
-        op  = f.get("operator", "").strip().upper()
+        col_expr = safe_column(f.get("column"))
+        op       = f.get("operator", "").strip().upper()
 
-        if not col:
-            raise ValueError("Each filter must include a 'column' field.")
         if op not in ALLOWED_OPERATORS:
-            raise ValueError(f"Operator '{op}' is not allowed. Use one of: {ALLOWED_OPERATORS}")
-
-        # Bracket the column name to handle reserved words / spaces
-        col_expr = f"[{col}]"
+            raise ValueError(f"Operator '{op}' is not allowed. Use one of: {sorted(ALLOWED_OPERATORS)}")
 
         if op in ("IS NULL", "IS NOT NULL"):
             clauses.append(f"{col_expr} {op}")
@@ -167,7 +237,13 @@ def build_where_clause(filters):
             clauses.append(f"{col_expr} {op} %s")
             params.append(f.get("value"))
 
-    return "WHERE " + " AND ".join(clauses), tuple(params)
+    return f"{keyword} " + " AND ".join(clauses), tuple(params)
+
+
+def serialise(v):
+    if isinstance(v, datetime):
+        return v.isoformat()
+    return v
 
 
 @app.before_request
@@ -192,24 +268,15 @@ def health():
 #
 # POST /query-data?table=<table>
 #
-# Request body (JSON):
 # {
 #   "filters": [
 #     {"column": "status",     "operator": "=",    "value": "active"},
-#     {"column": "created_at", "operator": ">=",   "value": "2024-01-01"},
 #     {"column": "region",     "operator": "IN",   "value": ["ZA", "NG"]},
 #     {"column": "deleted_at", "operator": "IS NULL"}
 #   ]
 # }
 #
-# Response format:
-# {
-#   "data": [
-#     [0, {...row...}],   ← row index + row object
-#     [1, {...row...}],
-#     ...
-#   ]
-# }
+# Response: {"data": [[0, {...row...}], [1, {...row...}], ...]}
 # ===============================
 @app.route("/query-data", methods=["POST"])
 def query_data():
@@ -219,25 +286,19 @@ def query_data():
     start_time = datetime.now()
 
     try:
-        payload      = request.get_json() or {}
-        target_table = request.args.get("table")
-
-        if not target_table:
-            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
-
-        filters = payload.get("filters", [])
+        payload = request.get_json() or {}
 
         try:
-            where_clause, params = build_where_clause(filters)
+            target_table = safe_table(request.args.get("table"))
+            where_clause, params = build_where_clause(payload.get("filters", []))
         except ValueError as ve:
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
         sql = f"SELECT * FROM {target_table}"
-        
         if where_clause:
             sql += f" {where_clause}"
 
-        print(f"QUERY | table={target_table} | filters={len(filters)} | sql={sql}")
+        print(f"QUERY | sql={sql} | params={params}")
 
         conn   = get_connection()
         cursor = conn.cursor(as_dict=True)
@@ -247,23 +308,11 @@ def query_data():
             rows = cursor.fetchall()
             cursor.close()
             return_connection(conn)
-
-        except Exception as e:
+        except Exception:
             invalidate_connection(conn)
             raise
 
-        # Serialise: datetimes → ISO strings, keep None as null
-        def serialise(v):
-            if isinstance(v, datetime):
-                return v.isoformat()
-            return v
-
-        clean_rows = [
-            {k: serialise(v) for k, v in row.items()}
-            for row in rows
-        ]
-
-        # Snowflake External Function envelope: list of [row_index, value] pairs
+        clean_rows = [{k: serialise(v) for k, v in row.items()} for row in rows]
         result = [[i, row] for i, row in enumerate(clean_rows)]
 
         duration = (datetime.now() - start_time).total_seconds()
@@ -278,28 +327,18 @@ def query_data():
 
 
 # ===============================
-# AGGREGATE ENDPOINT (GROUP BY)
+# AGGREGATE ENDPOINT (GROUP BY [+ HAVING])
 #
 # POST /aggregate-data?table=<table>
 #
-# Request body (JSON):
 # {
-#   "select_columns": ["COUNT(1) AS count", "BATCHNAME", "SYSTEMMESSAGE"],
-#   "group_by": ["BATCHNAME", "SYSTEMMESSAGE"],
-#   "filters": [
-#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"},
-#     {"column": "createdondate", "operator": ">=", "value": "2024-01-15"}
-#   ]
+#   "select_columns": ["COUNT(1) AS DUP_COUNT", "CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
+#   "group_by":       ["CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
+#   "having":         "COUNT(1) > 1",
+#   "filters":        [{"column": "PROCESSEDFAILED", "operator": "=", "value": 0}]
 # }
 #
-# Response format:
-# {
-#   "data": [
-#     [0, {"count": 42, "BATCHNAME": "BATCH_001", "SYSTEMMESSAGE": null}],
-#     [1, {"count": 15, "BATCHNAME": "BATCH_002", "SYSTEMMESSAGE": null}],
-#     ...
-#   ]
-# }
+# 'having' is optional and only accepts COUNT(1) <op> <number>.
 # ===============================
 @app.route("/aggregate-data", methods=["POST"])
 def aggregate_data():
@@ -309,44 +348,32 @@ def aggregate_data():
     start_time = datetime.now()
 
     try:
-        payload      = request.get_json() or {}
-        target_table = request.args.get("table")
-
-        if not target_table:
-            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
+        payload = request.get_json() or {}
 
         select_columns = payload.get("select_columns", [])
         group_by_cols  = payload.get("group_by", [])
-        filters        = payload.get("filters", [])
 
         if not select_columns:
-            return jsonify({
-                "statusCode": 400, 
-                "body": "Missing 'select_columns' for aggregate query"
-            }), 400
-
+            return jsonify({"statusCode": 400, "body": "Missing 'select_columns' for aggregate query"}), 400
         if not group_by_cols:
-            return jsonify({
-                "statusCode": 400, 
-                "body": "Missing 'group_by' for aggregate query"
-            }), 400
+            return jsonify({"statusCode": 400, "body": "Missing 'group_by' for aggregate query"}), 400
 
         try:
-            where_clause, params = build_where_clause(filters)
+            target_table  = safe_table(request.args.get("table"))
+            where_clause, params = build_where_clause(payload.get("filters", []))
+            having_clause = safe_having(payload.get("having"))
+            group_by_expr = ", ".join(safe_column(c) for c in group_by_cols)
         except ValueError as ve:
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
-        # Bracket all GROUP BY columns to handle reserved words
-        group_by_expr = ", ".join(f"[{col}]" for col in group_by_cols)
-        
         sql = f"SELECT {', '.join(select_columns)} FROM {target_table}"
-        
         if where_clause:
             sql += f" {where_clause}"
-        
         sql += f" GROUP BY {group_by_expr}"
+        if having_clause:
+            sql += f" {having_clause}"
 
-        print(f"AGGREGATE | table={target_table} | filters={len(filters)} | group_by={len(group_by_cols)} | sql={sql}")
+        print(f"AGGREGATE | sql={sql} | params={params}")
 
         conn   = get_connection()
         cursor = conn.cursor(as_dict=True)
@@ -356,23 +383,11 @@ def aggregate_data():
             rows = cursor.fetchall()
             cursor.close()
             return_connection(conn)
-
-        except Exception as e:
+        except Exception:
             invalidate_connection(conn)
             raise
 
-        # Serialise: datetimes → ISO strings, keep None as null
-        def serialise(v):
-            if isinstance(v, datetime):
-                return v.isoformat()
-            return v
-
-        clean_rows = [
-            {k: serialise(v) for k, v in row.items()}
-            for row in rows
-        ]
-
-        # Snowflake External Function envelope: list of [row_index, value] pairs
+        clean_rows = [{k: serialise(v) for k, v in row.items()} for row in rows]
         result = [[i, row] for i, row in enumerate(clean_rows)]
 
         duration = (datetime.now() - start_time).total_seconds()
@@ -391,32 +406,28 @@ def aggregate_data():
 #
 # POST /delete-data?table=<table>
 #
-# Request body (JSON) - Two options:
-#
-# Option 1: Delete by filter conditions
+# Option 1 - delete by filter:
 # {
-#   "filters": [
-#     {"column": "TEMPUPLOADID", "operator": "NOT IN", "value": [1, 2, 3]},
-#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"}
-#   ]
+#   "filters": [{"column": "TEMPUPLOADID", "operator": "IN", "value": [123]}],
+#   "dry_run": true
 # }
 #
-# Option 2: Delete duplicates (keep max ID for each partition)
+# Option 2 - delete duplicates, keep one row per partition:
 # {
 #   "delete_duplicates": true,
-#   "partition_by": ["CELLNUMBER"],
+#   "partition_by": ["CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
 #   "order_by": "TEMPUPLOADID DESC",
-#   "filters": [
-#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"}
-#   ]
+#   "filters": [{"column": "PROCESSEDFAILED", "operator": "=", "value": 0}],
+#   "dry_run": true
 # }
 #
-# Response format:
-# {
-#   "statusCode": 200,
-#   "rows_deleted": 42,
-#   "message": "Successfully deleted 42 rows"
-# }
+# order_by DESC keeps the HIGHEST value (newest row); ASC keeps the lowest.
+# The filter is applied INSIDE the de-duplication window, so only rows
+# matching it are ever considered or deleted.
+#
+# dry_run: true returns {"rows_matched": N} and deletes nothing.
+#
+# Response: {"statusCode": 200, "rows_deleted": 42, "message": "..."}
 # ===============================
 @app.route("/delete-data", methods=["POST"])
 def delete_data():
@@ -426,66 +437,81 @@ def delete_data():
     start_time = datetime.now()
 
     try:
-        payload      = request.get_json() or {}
-        target_table = request.args.get("table")
+        payload = request.get_json() or {}
 
-        if not target_table:
-            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
-
-        delete_duplicates = payload.get("delete_duplicates", False)
-        filters = payload.get("filters", [])
+        delete_duplicates = bool(payload.get("delete_duplicates", False))
+        dry_run           = bool(payload.get("dry_run", False))
+        filters           = payload.get("filters", [])
 
         try:
+            target_table = safe_table(request.args.get("table"))
             where_clause, params = build_where_clause(filters)
         except ValueError as ve:
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
-        conn = get_connection()
+        # ---- build the statement --------------------------------------
+        if delete_duplicates:
+            partition_by = payload.get("partition_by", [])
+            if not partition_by:
+                return jsonify({"statusCode": 400,
+                                "body": "partition_by required for delete_duplicates"}), 400
+            try:
+                partition_expr = ", ".join(safe_column(c) for c in partition_by)
+                order_expr     = safe_order_by(payload.get("order_by", "TEMPUPLOADID DESC"))
+            except ValueError as ve:
+                return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+            # The WHERE clause sits inside the CTE. This is the important bit:
+            # rows excluded by the filter are neither ranked nor deleted.
+            cte = f"""
+                WITH dupes AS (
+                    SELECT ROW_NUMBER() OVER (
+                               PARTITION BY {partition_expr}
+                               ORDER BY {order_expr}
+                           ) AS rn
+                    FROM {target_table}
+                    {where_clause}
+                )
+            """
+            count_sql  = f"{cte} SELECT COUNT(*) FROM dupes WHERE rn > 1;"
+            delete_sql = f"{cte} DELETE FROM dupes WHERE rn > 1;"
+            label      = f"DELETE DUPLICATES | partition_by={partition_by} | order_by={order_expr}"
+
+        else:
+            if not where_clause:
+                return jsonify({"statusCode": 400,
+                                "body": "No filters provided for delete"}), 400
+            count_sql  = f"SELECT COUNT(*) FROM {target_table} {where_clause};"
+            delete_sql = f"DELETE FROM {target_table} {where_clause};"
+            label      = f"DELETE | filters={len(filters)}"
+
+        # ---- execute ---------------------------------------------------
+        conn   = get_connection()
         cursor = conn.cursor()
 
         try:
-            if delete_duplicates:
-                # Delete duplicates - keep only the MAX ID for each partition
-                partition_by = payload.get("partition_by", [])
-                order_by = payload.get("order_by", "TEMPUPLOADID DESC")
+            if dry_run:
+                print(f"{label} | DRY RUN | sql={count_sql} | params={params}")
+                cursor.execute(count_sql, params) if params else cursor.execute(count_sql)
+                rows_matched = cursor.fetchone()[0]
+                cursor.close()
+                return_connection(conn)
 
-                if not partition_by:
-                    return jsonify({"statusCode": 400, "body": "partition_by required for delete_duplicates"}), 400
+                duration = (datetime.now() - start_time).total_seconds()
+                print(f"DRY RUN DONE | {rows_matched} rows would be deleted | {duration:.2f}s")
+                return jsonify({
+                    "statusCode": 200,
+                    "dry_run": True,
+                    "rows_matched": rows_matched,
+                    "rows_deleted": 0,
+                    "message": f"Dry run: {rows_matched} row(s) would be deleted",
+                    "duration_seconds": duration
+                }), 200
 
-                partition_expr = ", ".join(f"[{col}]" for col in partition_by)
-                
-                delete_sql = f"""
-                    DELETE FROM {target_table}
-                    WHERE [TEMPUPLOADID] NOT IN (
-                        SELECT MAX([TEMPUPLOADID])
-                        FROM {target_table}
-                        GROUP BY {partition_expr}
-                    )
-                """
-                
-                if where_clause:
-                    delete_sql += f" AND {where_clause}"
-                
-                print(f"DELETE DUPLICATES | table={target_table} | partition_by={partition_by} | sql={delete_sql}")
-                
-                cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
-                conn.commit()
-                rows_deleted = cursor.rowcount
-
-            else:
-                # Standard delete with filters
-                delete_sql = f"DELETE FROM {target_table}"
-                
-                if where_clause:
-                    delete_sql += f" {where_clause}"
-                else:
-                    return jsonify({"statusCode": 400, "body": "No filters provided for delete"}), 400
-
-                print(f"DELETE | table={target_table} | filters={len(filters)} | sql={delete_sql}")
-                
-                cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
-                conn.commit()
-                rows_deleted = cursor.rowcount
+            print(f"{label} | sql={delete_sql} | params={params}")
+            cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
+            rows_deleted = cursor.rowcount
+            conn.commit()
 
             cursor.close()
             return_connection(conn)
@@ -495,13 +521,17 @@ def delete_data():
 
             return jsonify({
                 "statusCode": 200,
+                "dry_run": False,
                 "rows_deleted": rows_deleted,
                 "message": f"Successfully deleted {rows_deleted} rows",
                 "duration_seconds": duration
             }), 200
 
-        except Exception as e:
-            conn.rollback()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             invalidate_connection(conn)
             raise
 
@@ -527,21 +557,25 @@ def insert_data():
             return jsonify({"statusCode": 400, "body": "Invalid payload"}), 400
 
         rows_data     = payload["data"]
-        target_table  = request.args.get("table")
         columns_param = request.args.get("columns")
         do_truncate   = request.args.get("truncate", "false").lower() == "true"
         do_nocheck    = request.args.get("nocheck",  "true" ).lower() == "true"
 
-        if not target_table or not columns_param:
-            return jsonify({"statusCode": 400, "body": "Missing table or columns"}), 400
+        if not columns_param:
+            return jsonify({"statusCode": 400, "body": "Missing columns"}), 400
+
+        try:
+            target_table = safe_table(request.args.get("table"))
+            columns      = [c.strip() for c in columns_param.split(",")]
+            columns_str  = ", ".join(safe_column(c) for c in columns)
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
         if not rows_data:
             return jsonify({"data": []}), 200
 
-        columns     = [c.strip() for c in columns_param.split(",")]
         num_columns = len(columns)
         BATCH_SIZE  = get_batch_size(num_columns)
-        columns_str = ", ".join(f"[{c}]" for c in columns)
         total_rows  = len(rows_data)
 
         print(f"INSERT {target_table} | {total_rows} rows | {num_columns} cols | "
@@ -584,7 +618,7 @@ def insert_data():
                 conn.commit()
 
             if do_nocheck:
-                print(f"  Disabling constraints and indexes...")
+                print("  Disabling constraints and indexes...")
                 cursor.execute(f"ALTER TABLE {target_table} NOCHECK CONSTRAINT ALL")
                 conn.commit()
                 cursor.execute(f"""
@@ -624,7 +658,7 @@ def insert_data():
                     results.extend([rn, "ERROR", err] for rn in batch_nums)
 
             if do_nocheck:
-                print(f"  Re-enabling constraints and rebuilding indexes...")
+                print("  Re-enabling constraints and rebuilding indexes...")
                 cursor.execute(f"ALTER TABLE {target_table} WITH CHECK CHECK CONSTRAINT ALL")
                 conn.commit()
                 cursor.execute(f"""
