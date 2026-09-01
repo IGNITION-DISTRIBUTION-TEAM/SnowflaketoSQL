@@ -25,6 +25,10 @@ ALLOWED_TABLES = {
     if t.strip()
 }
 
+# Set DEBUG_SQL=true to log bound parameter values. Off by default: filter
+# values include cell numbers and ID numbers, which should not sit in logs.
+DEBUG_SQL = (os.environ.get("DEBUG_SQL") or "false").strip().lower() == "true"
+
 CONNECTION_TIMEOUT = 60
 
 # ===============================
@@ -174,21 +178,19 @@ def safe_order_by(raw):
     return f"[{m.group(1)}] {(m.group(2) or 'DESC').upper()}"
 
 
-# Only aggregate predicates of the form COUNT(1) > 1 are permitted.
-_HAVING_RE = re.compile(
-    r"^\s*(COUNT)\s*\(\s*(1|\*)\s*\)\s*(=|!=|<>|>=|<=|>|<)\s*(\d+)\s*$", re.I
-)
-
-def safe_having(raw):
-    """Validate an optional HAVING clause. Returns '' or 'HAVING COUNT(1) > 1'."""
-    if not raw:
-        return ""
-    m = _HAVING_RE.match(raw)
-    if not m:
-        raise ValueError(
-            f"Invalid having: {raw!r}. Only 'COUNT(1) <op> <number>' is supported."
-        )
-    return f"HAVING COUNT({m.group(2)}) {m.group(3)} {m.group(4)}"
+def safe_int(raw, name, default, minimum=1, maximum=None):
+    """Validate an integer payload value. Raises ValueError on bad input."""
+    if raw is None:
+        return default
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be an integer, got {raw!r}")
+    if n < minimum:
+        raise ValueError(f"'{name}' must be >= {minimum}, got {n}")
+    if maximum is not None and n > maximum:
+        raise ValueError(f"'{name}' must be <= {maximum}, got {n}")
+    return n
 
 
 # Allowlist of valid SQL comparison operators to prevent injection
@@ -298,7 +300,7 @@ def query_data():
         if where_clause:
             sql += f" {where_clause}"
 
-        print(f"QUERY | sql={sql} | params={params}")
+        print(f"QUERY | sql={sql}" + (f" | params={params}" if DEBUG_SQL else ""))
 
         conn   = get_connection()
         cursor = conn.cursor(as_dict=True)
@@ -327,18 +329,31 @@ def query_data():
 
 
 # ===============================
-# AGGREGATE ENDPOINT (GROUP BY [+ HAVING])
+# AGGREGATE ENDPOINT (GROUP BY)
+#
+# UNCHANGED from the original implementation. Do not add behaviour here -
+# put it on a new route instead (see /find-duplicates below).
 #
 # POST /aggregate-data?table=<table>
 #
+# Request body (JSON):
 # {
-#   "select_columns": ["COUNT(1) AS DUP_COUNT", "CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
-#   "group_by":       ["CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
-#   "having":         "COUNT(1) > 1",
-#   "filters":        [{"column": "PROCESSEDFAILED", "operator": "=", "value": 0}]
+#   "select_columns": ["COUNT(1) AS count", "BATCHNAME", "SYSTEMMESSAGE"],
+#   "group_by": ["BATCHNAME", "SYSTEMMESSAGE"],
+#   "filters": [
+#     {"column": "SYSTEMMESSAGE", "operator": "IS NULL"},
+#     {"column": "createdondate", "operator": ">=", "value": "2024-01-15"}
+#   ]
 # }
 #
-# 'having' is optional and only accepts COUNT(1) <op> <number>.
+# Response format:
+# {
+#   "data": [
+#     [0, {"count": 42, "BATCHNAME": "BATCH_001", "SYSTEMMESSAGE": null}],
+#     [1, {"count": 15, "BATCHNAME": "BATCH_002", "SYSTEMMESSAGE": null}],
+#     ...
+#   ]
+# }
 # ===============================
 @app.route("/aggregate-data", methods=["POST"])
 def aggregate_data():
@@ -348,32 +363,44 @@ def aggregate_data():
     start_time = datetime.now()
 
     try:
-        payload = request.get_json() or {}
+        payload      = request.get_json() or {}
+        target_table = request.args.get("table")
+
+        if not target_table:
+            return jsonify({"statusCode": 400, "body": "Missing 'table' query param"}), 400
 
         select_columns = payload.get("select_columns", [])
         group_by_cols  = payload.get("group_by", [])
+        filters        = payload.get("filters", [])
 
         if not select_columns:
-            return jsonify({"statusCode": 400, "body": "Missing 'select_columns' for aggregate query"}), 400
+            return jsonify({
+                "statusCode": 400,
+                "body": "Missing 'select_columns' for aggregate query"
+            }), 400
+
         if not group_by_cols:
-            return jsonify({"statusCode": 400, "body": "Missing 'group_by' for aggregate query"}), 400
+            return jsonify({
+                "statusCode": 400,
+                "body": "Missing 'group_by' for aggregate query"
+            }), 400
 
         try:
-            target_table  = safe_table(request.args.get("table"))
-            where_clause, params = build_where_clause(payload.get("filters", []))
-            having_clause = safe_having(payload.get("having"))
-            group_by_expr = ", ".join(safe_column(c) for c in group_by_cols)
+            where_clause, params = build_where_clause(filters)
         except ValueError as ve:
             return jsonify({"statusCode": 400, "body": str(ve)}), 400
 
+        # Bracket all GROUP BY columns to handle reserved words
+        group_by_expr = ", ".join(f"[{col}]" for col in group_by_cols)
+
         sql = f"SELECT {', '.join(select_columns)} FROM {target_table}"
+
         if where_clause:
             sql += f" {where_clause}"
-        sql += f" GROUP BY {group_by_expr}"
-        if having_clause:
-            sql += f" {having_clause}"
 
-        print(f"AGGREGATE | sql={sql} | params={params}")
+        sql += f" GROUP BY {group_by_expr}"
+
+        print(f"AGGREGATE | table={target_table} | filters={len(filters)} | group_by={len(group_by_cols)} | sql={sql}")
 
         conn   = get_connection()
         cursor = conn.cursor(as_dict=True)
@@ -383,11 +410,17 @@ def aggregate_data():
             rows = cursor.fetchall()
             cursor.close()
             return_connection(conn)
-        except Exception:
+
+        except Exception as e:
             invalidate_connection(conn)
             raise
 
-        clean_rows = [{k: serialise(v) for k, v in row.items()} for row in rows]
+        clean_rows = [
+            {k: serialise(v) for k, v in row.items()}
+            for row in rows
+        ]
+
+        # Snowflake External Function envelope: list of [row_index, value] pairs
         result = [[i, row] for i, row in enumerate(clean_rows)]
 
         duration = (datetime.now() - start_time).total_seconds()
@@ -398,6 +431,193 @@ def aggregate_data():
     except Exception as e:
         duration = (datetime.now() - start_time).total_seconds()
         print(f"AGGREGATE ERROR after {duration:.2f}s: {e}")
+        return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
+
+
+# ===============================
+# FIND DUPLICATES ENDPOINT
+#
+# POST /find-duplicates?table=<table>
+#
+# Returns ONLY rows that participate in a duplicate group. The de-duplication
+# happens in SQL Server, so a 300k-row table returns the handful of duplicate
+# rows rather than 300k rows.
+#
+# Request body (JSON):
+# {
+#   "partition_by": ["CELLNUMBER", "CAMPAIGNID", "IDNUMBER"],
+#   "filters":      [{"column": "PROCESSEDFAILED", "operator": "=", "value": 0}],
+#   "id_column":    "TEMPUPLOADID",     optional - enables MIN_ID / MAX_ID / RN
+#   "order_by":     "TEMPUPLOADID DESC",optional - which row ranks RN = 1 (the keeper)
+#   "include_rows": false,              false = one row per group (default)
+#                                       true  = every duplicate row, full detail
+#   "select_columns": ["CELLNUMBER"],   optional, include_rows only.
+#                                       Omit for SELECT * . Validated names only.
+#   "min_count":    2,                  optional - group size threshold
+#   "top_n":        1000                optional - row cap (default 1000, max 50000)
+# }
+#
+# Response:
+# {
+#   "summary": {
+#     "DUPLICATE_GROUPS": 1,
+#     "ROWS_IN_DUPLICATE_GROUPS": 2,
+#     "ROWS_TO_DELETE": 1,
+#     "LARGEST_GROUP": 2
+#   },
+#   "truncated": false,
+#   "data": [[0, {...}], [1, {...}], ...]
+# }
+#
+# With include_rows = true each row carries:
+#   ROWS_IN_GROUP - size of its duplicate group
+#   RN            - 1 = the row that would be KEPT, > 1 = would be DELETED
+#                   (only present when id_column or order_by is supplied)
+# ===============================
+@app.route("/find-duplicates", methods=["POST"])
+def find_duplicates():
+    if not verify_token(request):
+        return jsonify({"statusCode": 401, "body": "Unauthorized"}), 401
+
+    start_time = datetime.now()
+
+    try:
+        payload = request.get_json() or {}
+
+        partition_by = payload.get("partition_by", [])
+        if not partition_by:
+            return jsonify({"statusCode": 400,
+                            "body": "partition_by required for find-duplicates"}), 400
+
+        include_rows = bool(payload.get("include_rows", False))
+
+        try:
+            target_table   = safe_table(request.args.get("table"))
+            where_clause, params = build_where_clause(payload.get("filters", []))
+            partition_expr = ", ".join(safe_column(c) for c in partition_by)
+            min_count      = safe_int(payload.get("min_count"), "min_count", 2, minimum=2)
+            top_n          = safe_int(payload.get("top_n"), "top_n", 1000,
+                                      minimum=1, maximum=50000)
+
+            id_column = payload.get("id_column")
+            order_raw = payload.get("order_by") or (
+                f"{id_column} DESC" if id_column else None
+            )
+            order_expr = safe_order_by(order_raw) if order_raw else None
+            id_expr    = safe_column(id_column) if id_column else None
+
+            sel = payload.get("select_columns")
+            if sel:
+                select_expr = ", ".join(safe_column(c) for c in sel)
+            else:
+                select_expr = "*"
+        except ValueError as ve:
+            return jsonify({"statusCode": 400, "body": str(ve)}), 400
+
+        # ---- summary: always computed over ALL duplicate groups, uncapped ----
+        summary_sql = f"""
+            SELECT
+                COUNT(*)                AS DUPLICATE_GROUPS,
+                SUM(ROWS_IN_GROUP)      AS ROWS_IN_DUPLICATE_GROUPS,
+                SUM(ROWS_IN_GROUP - 1)  AS ROWS_TO_DELETE,
+                MAX(ROWS_IN_GROUP)      AS LARGEST_GROUP
+            FROM (
+                SELECT COUNT(*) AS ROWS_IN_GROUP
+                FROM {target_table}
+                {where_clause}
+                GROUP BY {partition_expr}
+                HAVING COUNT(*) >= {min_count}
+            ) g;
+        """
+
+        # ---- detail ----------------------------------------------------
+        if include_rows:
+            rn_select = (
+                f", ROW_NUMBER() OVER (PARTITION BY {partition_expr} "
+                f"ORDER BY {order_expr}) AS RN"
+                if order_expr else ""
+            )
+            order_out = "ROWS_IN_GROUP DESC" + (", RN" if order_expr else "")
+            detail_sql = f"""
+                WITH ranked AS (
+                    SELECT {select_expr},
+                           COUNT(*) OVER (PARTITION BY {partition_expr}) AS ROWS_IN_GROUP
+                           {rn_select}
+                    FROM {target_table}
+                    {where_clause}
+                )
+                SELECT TOP ({top_n}) *
+                FROM ranked
+                WHERE ROWS_IN_GROUP >= {min_count}
+                ORDER BY {order_out};
+            """
+        else:
+            id_aggs = (
+                f", MIN({id_expr}) AS MIN_ID, MAX({id_expr}) AS MAX_ID"
+                if id_expr else ""
+            )
+            detail_sql = f"""
+                SELECT TOP ({top_n})
+                    {partition_expr},
+                    COUNT(*)     AS ROWS_IN_GROUP,
+                    COUNT(*) - 1 AS ROWS_TO_DELETE
+                    {id_aggs}
+                FROM {target_table}
+                {where_clause}
+                GROUP BY {partition_expr}
+                HAVING COUNT(*) >= {min_count}
+                ORDER BY COUNT(*) DESC;
+            """
+
+        print(f"FIND DUPLICATES | table={target_table} | partition_by={partition_by} | "
+              f"include_rows={include_rows} | min_count={min_count} | top_n={top_n}")
+        if DEBUG_SQL:
+            print(f"  summary_sql={summary_sql}")
+            print(f"  detail_sql={detail_sql}")
+            print(f"  params={params}")
+
+        conn   = get_connection()
+        cursor = conn.cursor(as_dict=True)
+
+        try:
+            cursor.execute(summary_sql, params) if params else cursor.execute(summary_sql)
+            summary_row = cursor.fetchone() or {}
+
+            cursor.execute(detail_sql, params) if params else cursor.execute(detail_sql)
+            rows = cursor.fetchall()
+
+            cursor.close()
+            return_connection(conn)
+        except Exception:
+            invalidate_connection(conn)
+            raise
+
+        summary = {
+            "DUPLICATE_GROUPS":         summary_row.get("DUPLICATE_GROUPS") or 0,
+            "ROWS_IN_DUPLICATE_GROUPS": summary_row.get("ROWS_IN_DUPLICATE_GROUPS") or 0,
+            "ROWS_TO_DELETE":           summary_row.get("ROWS_TO_DELETE") or 0,
+            "LARGEST_GROUP":            summary_row.get("LARGEST_GROUP") or 0,
+        }
+
+        clean_rows = [{k: serialise(v) for k, v in row.items()} for row in rows]
+        result = [[i, row] for i, row in enumerate(clean_rows)]
+
+        truncated = len(rows) >= top_n
+
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"FIND DUPLICATES DONE | groups={summary['DUPLICATE_GROUPS']} | "
+              f"rows_to_delete={summary['ROWS_TO_DELETE']} | returned={len(rows)} | "
+              f"truncated={truncated} | {duration:.2f}s")
+
+        return jsonify({
+            "summary":   summary,
+            "truncated": truncated,
+            "data":      result
+        }), 200
+
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        print(f"FIND DUPLICATES ERROR after {duration:.2f}s: {e}")
         return jsonify({"statusCode": 500, "body": f"Server error: {str(e)}"}), 500
 
 
@@ -491,7 +711,8 @@ def delete_data():
 
         try:
             if dry_run:
-                print(f"{label} | DRY RUN | sql={count_sql} | params={params}")
+                print(f"{label} | DRY RUN | sql={count_sql}"
+                      + (f" | params={params}" if DEBUG_SQL else ""))
                 cursor.execute(count_sql, params) if params else cursor.execute(count_sql)
                 rows_matched = cursor.fetchone()[0]
                 cursor.close()
@@ -508,7 +729,8 @@ def delete_data():
                     "duration_seconds": duration
                 }), 200
 
-            print(f"{label} | sql={delete_sql} | params={params}")
+            print(f"{label} | sql={delete_sql}"
+                  + (f" | params={params}" if DEBUG_SQL else ""))
             cursor.execute(delete_sql, params) if params else cursor.execute(delete_sql)
             rows_deleted = cursor.rowcount
             conn.commit()
